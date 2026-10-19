@@ -193,6 +193,7 @@ UA_GDSTransaction_init(UA_GDSTransaction *transaction, UA_Server *server, const 
     UA_NodeId_copy(&sessionId, &transaction->sessionId);
     transaction->server = server;
     transaction->localCsrCertificate = csr;
+    transaction->applyChangesQueued = false;
 
     return UA_STATUSCODE_GOOD;
 }
@@ -570,8 +571,8 @@ UA_Server_init(UA_Server *server) {
 #endif
 
     /* Initialize namespace 0 */
-#ifdef UA_GENERATED_NAMESPACE_ZERO
-    /* Standard configuration: generate NS0 nodes at runtime */
+#if defined(UA_GENERATED_NAMESPACE_ZERO) || defined(UA_NAMESPACE_ZERO_MINIMAL)
+    /* Generate NS0 nodes at runtime or create the minimal NS0 */
     res = initNS0(server);
 #else
     /* NONE configuration: NS0 pre-loaded by external nodestore (e.g., ROM).
@@ -978,6 +979,16 @@ UA_Server_updateCertificate(UA_Server *server,
             return UA_STATUSCODE_BADNOTSUPPORTED;
         }
         newPrivateKey = *privateKey;
+    } else {
+#ifdef UA_ENABLE_ENCRYPTION
+        /* No key to pair the certificate with, so check that it parses */
+        size_t keySize = 0;
+        if(UA_CertificateUtils_getKeySize((UA_ByteString*)(uintptr_t)&certificate,
+                                          &keySize) != UA_STATUSCODE_GOOD) {
+            unlockServer(server);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+#endif
     }
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
@@ -1181,7 +1192,7 @@ setServerLifecycleState(UA_Server *server, UA_LifecycleState state) {
     if(config->globalNotificationCallback || config->lifecycleNotificationCallback) {
         UA_ApplicationNotificationType nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STARTED;
         switch(state) {
-        case UA_LIFECYCLESTATE_STOPPED: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
+        case UA_LIFECYCLESTATE_STOPPED: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPED; break;
         case UA_LIFECYCLESTATE_STOPPING: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
         default: break;
         }
@@ -1443,7 +1454,10 @@ UA_Server_run_shutdown(UA_Server *server) {
     UA_EventLoop *el = server->config.eventLoop;
     while(!testStoppedCondition(server) &&
           res == UA_STATUSCODE_GOOD) {
+        /* Event-loop callbacks on other threads may need the server lock. */
+        unlockServer(server);
         res = el->run(el, 100);
+        lockServer(server);
     }
 
     /* Stop the EventLoop. Iterate until stopped. */
@@ -1451,7 +1465,10 @@ UA_Server_run_shutdown(UA_Server *server) {
     while(el->state != UA_EVENTLOOPSTATE_STOPPED &&
           el->state != UA_EVENTLOOPSTATE_FRESH &&
           res == UA_STATUSCODE_GOOD) {
+        /* Event-loop callbacks on other threads may need the server lock. */
+        unlockServer(server);
         res = el->run(el, 100);
+        lockServer(server);
     }
 
     /* Set server lifecycle state to stopped if not already the case */

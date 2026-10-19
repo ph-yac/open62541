@@ -10,8 +10,9 @@
 #include <open62541/server_config_default.h>
 #include <open62541/server_pubsub.h>
 
-#include "ua_pubsub_internal.h"
+#include "pubsub_test_helpers.h"
 #include "ua_pubsub_keystorage.h"
+#include "ua_pubsub_internal.h"
 #include "ua_server_internal.h"
 
 #include <check.h>
@@ -133,6 +134,7 @@ createKeyStoragewithkeys(UA_UInt32 currentTokenId, UA_UInt32 keysize,
     UA_ByteString_allocBuffer(&currentKey, keyLength);
     generateKeyData(server->config.pubSubConfig.securityPolicies, &currentKey);
 
+    futureKeySize = keysize;
     futureKey = (UA_ByteString *)UA_calloc(keysize, sizeof(UA_ByteString));
     if(!futureKey)
         return NULL;
@@ -203,7 +205,7 @@ setup(void) {
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
     connectionConfig.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
@@ -273,6 +275,100 @@ START_TEST(TestPubSubKeyStorageSetKeys){
     ck_assert_msg(UA_ByteString_equal(&futureKey[futureKeySize - 1], &keyListIterator->key), "Expected lastItem to be equal to the last FutureKey");
     ck_assert_msg(futureKeySize + 1 == tKeyStorage->keyListSize,"Expected KeyListSize to be equal to FutureKeySize + 1");
     ck_assert_msg(tKeyStorage->keyLifeTime == msTimeToNextKey, "Expected keyLifetime to be equal to the Keystorage->keyLifeTime");
+    unlockServer(server);
+} END_TEST
+
+static void
+setValidGetSecurityKeysOutput(UA_CallResponse *response,
+                              UA_CallMethodResult *result,
+                              UA_Variant output[5],
+                              UA_ByteString keys[1]) {
+    UA_CallResponse_init(response);
+    UA_CallMethodResult_init(result);
+    memset(output, 0, 5 * sizeof(UA_Variant));
+    response->results = result;
+    response->resultsSize = 1;
+    result->outputArguments = output;
+    result->outputArgumentsSize = 5;
+
+    static UA_String policyUri = UA_STRING_STATIC("policy");
+    static UA_UInt32 tokenId = 1;
+    static UA_Duration timeToNextKey = 1000;
+    static UA_Duration keyLifetime = 2000;
+    keys[0] = UA_BYTESTRING("key");
+    UA_Variant_setScalar(&output[0], &policyUri,
+                         &UA_TYPES[UA_TYPES_STRING]);
+    UA_Variant_setScalar(&output[1], &tokenId,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    UA_Variant_setArray(&output[2], keys, 1,
+                        &UA_TYPES[UA_TYPES_BYTESTRING]);
+    UA_Variant_setScalar(&output[3], &timeToNextKey,
+                         &UA_TYPES[UA_TYPES_DURATION]);
+    UA_Variant_setScalar(&output[4], &keyLifetime,
+                         &UA_TYPES[UA_TYPES_DURATION]);
+}
+
+START_TEST(TestGetSecurityKeysResponseValidation) {
+    UA_CallResponse response;
+    UA_CallMethodResult result;
+    UA_Variant output[5];
+    UA_ByteString keys[1];
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(NULL),
+        UA_STATUSCODE_BADDECODINGERROR);
+
+    setValidGetSecurityKeysOutput(&response, &result, output, keys);
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_GOOD);
+
+    UA_Variant_setScalar(&output[1], output[1].data,
+                         &UA_TYPES[UA_TYPES_INTEGERID]);
+    UA_Variant_setScalar(&output[3], output[3].data,
+                         &UA_TYPES[UA_TYPES_DOUBLE]);
+    UA_Variant_setScalar(&output[4], output[4].data,
+                         &UA_TYPES[UA_TYPES_DOUBLE]);
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_GOOD);
+
+    UA_Int32 invalidKeys = 42;
+    UA_Variant_setScalar(&output[2], &invalidKeys,
+                         &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_BADTYPEMISMATCH);
+
+    UA_Variant_setArray(&output[2], keys, 0,
+                        &UA_TYPES[UA_TYPES_BYTESTRING]);
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_BADTYPEMISMATCH);
+
+    result.outputArgumentsSize = 4;
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_BADDECODINGERROR);
+
+    response.resultsSize = 0;
+    ck_assert_uint_eq(
+        UA_PubSubKeyStorage_validateGetSecurityKeysResponse(&response),
+        UA_STATUSCODE_BADDECODINGERROR);
+} END_TEST
+
+START_TEST(TestClearKeyStorageResetsCurrentKey) {
+    UA_PubSubKeyStorage *ks =
+        createKeyStoragewithkeys(1, 1, 2000, 0, SecurityGroupId);
+    ck_assert_ptr_ne(ks, NULL);
+
+    UA_PubSubManager *psm = getPSM(server);
+    lockServer(server);
+    UA_PubSubKeyStorage_clearKeyList(ks);
+    UA_StatusCode retval = UA_PubSubKeyStorage_activateKeyToChannelContext(
+        psm, UA_NODEID_NULL, ks->securityGroupID);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADINTERNALERROR);
+    ck_assert_ptr_eq(ks->currentItem, NULL);
+    ck_assert_uint_eq(ks->keyListSize, 0);
     unlockServer(server);
 } END_TEST
 
@@ -409,6 +505,62 @@ START_TEST(TestRemoveAPubSubGroupWithKeyStorage){
     unlockServer(server);
 } END_TEST
 
+START_TEST(TestRemoveKeyStorageWithArmedRolloverTimer) {
+    UA_UInt32 currentTokenId = 1;
+    futureKeySize = 2;
+    UA_Duration keyLifetime = 2000;
+    UA_String testSecurityGroupId = UA_STRING("TestSecurityGroup");
+
+    UA_PubSubKeyStorage *ks =
+        createKeyStoragewithkeys(currentTokenId, futureKeySize, keyLifetime, 0,
+                                 testSecurityGroupId);
+    ck_assert_ptr_ne(ks, NULL);
+    ck_assert_uint_ne(ks->callBackId, 0);
+
+    UA_Server_removeWriterGroup(server, writerGroup);
+    UA_Server_removeReaderGroup(server, readerGroup);
+
+    lockServer(server);
+    UA_PubSubManager *psm = getPSM(server);
+    ck_assert_ptr_eq(UA_PubSubKeyStorage_find(psm, SecurityGroupId), NULL);
+    unlockServer(server);
+
+    UA_fakeSleep(keyLifetime + 1);
+    UA_Server_run_iterate(server, false);
+} END_TEST
+
+START_TEST(TestRemoveKeyStorageWithPendingRefetchTimer) {
+    UA_Duration keyLifeTime = 2000;
+    UA_PubSubKeyStorage *ks =
+        createKeyStoragewithkeys(1, 0, keyLifeTime, 0, SecurityGroupId);
+    ck_assert_ptr_ne(ks, NULL);
+    ks->sksConfig.endpointUrl = "opc.tcp://localhost:4840";
+
+    /* The current key is also the last key, so rollover schedules an SKS
+     * refetch after half the key lifetime. */
+    UA_PubSubKeyStorage_keyRolloverCallback(getPSM(server), ks);
+
+    /* Isolate this timer from the separate rollover-timer deletion case. */
+    lockServer(server);
+    server->config.eventLoop->removeTimer(server->config.eventLoop,
+                                          ks->callBackId);
+    ks->callBackId = 0;
+    unlockServer(server);
+
+    ck_assert_uint_eq(UA_Server_removeWriterGroup(server, writerGroup),
+                      UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_removeReaderGroup(server, readerGroup),
+                      UA_STATUSCODE_GOOD);
+
+    UA_fakeSleep(keyLifeTime / 2 + 1);
+    UA_Server_run_iterate(server, false);
+
+    lockServer(server);
+    ck_assert_ptr_eq(UA_PubSubKeyStorage_find(getPSM(server),
+                                              SecurityGroupId), NULL);
+    unlockServer(server);
+} END_TEST
+
 int
 main(void) {
     int number_failed = 0;
@@ -416,12 +568,19 @@ main(void) {
     tcase_add_checked_fixture(tc_pubsub_keystorage, setup, teardown);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeyStorage_initialize);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeyStorageSetKeys);
+    tcase_add_test(tc_pubsub_keystorage, TestGetSecurityKeysResponseValidation);
+    tcase_add_test(tc_pubsub_keystorage,
+                   TestClearKeyStorageResetsCurrentKey);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeyStorage_MovetoNextKeyCallback);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeystorage_ImportedKey);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeyStorage_InitWithWriterGroup);
     tcase_add_test(tc_pubsub_keystorage, TestPubSubKeyStorage_InitWithReaderGroup);
     tcase_add_test(tc_pubsub_keystorage, TestAddingNewGroupToExistingKeyStorage);
     tcase_add_test(tc_pubsub_keystorage, TestRemoveAPubSubGroupWithKeyStorage);
+    tcase_add_test(tc_pubsub_keystorage,
+                   TestRemoveKeyStorageWithArmedRolloverTimer);
+    tcase_add_test(tc_pubsub_keystorage,
+                   TestRemoveKeyStorageWithPendingRefetchTimer);
 
     Suite *s =
         suite_create("PubSub Keystorage and handling keys for Publisher and Subscriber");

@@ -227,20 +227,26 @@ setMulticastInterface(const char *netif, struct addrinfo *info,
             break;
     }
 
-    freeifaddrs(ifaddr);
-    if(!ifa)
+    if(!ifa) {
+        freeifaddrs(ifaddr);
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     /* Write the interface index */
     if(info->ai_family == AF_INET) {
 #if defined(__linux__)
         req->ipv4.imr_ifindex = idx;
+#elif defined(__APPLE__)
+        struct sockaddr_in *sin = (struct sockaddr_in*)ifa->ifa_addr;
+        req->ipv4.imr_interface = sin->sin_addr;
 #endif
 #if UA_IPV6
     } else { /* if(info->ai_family == AF_INET6) */
         req->ipv6.ipv6mr_interface = idx;
 #endif
     }
+
+    freeifaddrs(ifaddr);
     return UA_STATUSCODE_GOOD;
 }
 
@@ -284,7 +290,13 @@ setupMulticastRequest(UA_FD socket, MulticastRequest *req, const UA_KeyValueMap 
     }
 
     /* Set the interface index */
-    UA_STACKARRAY(char, interfaceAsChar, sizeof(char) * netif->length + 1);
+    if(netif->length >= UA_MAXHOSTNAME_LENGTH) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_NETWORK,
+                     "UDP %u\t| Network interface name too long",
+                     (unsigned)socket);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    char interfaceAsChar[UA_MAXHOSTNAME_LENGTH];
     memcpy(interfaceAsChar, netif->data, netif->length);
     interfaceAsChar[netif->length] = 0;
     return setMulticastInterface(interfaceAsChar, info, req, logger);
@@ -561,6 +573,9 @@ setupSendMultiCast(UA_FD fd, struct addrinfo *info, const UA_KeyValueMap *params
         result = UA_setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
                             (const char *)&req.ipv4.imr_interface,
                             sizeof(struct in_addr));
+#elif defined(__APPLE__)
+        result = UA_setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
+                            &req.ipv4.imr_interface, sizeof(struct in_addr));
 #else
         result = UA_setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
                             &req.ipv4, sizeof(req.ipv4));
@@ -695,7 +710,7 @@ UDP_connectionSocketCallback(UA_POSIXConnectionManager *pcm, UDP_FD *conn,
 
     /* Receive has failed */
     if(ret <= 0) {
-        if(UA_ERRNO == UA_INTERRUPTED)
+        if(ret < 0 && UA_ERRNO == UA_INTERRUPTED)
             return;
 
         /* Orderly shutdown of the socket. We can immediately close as no method
@@ -1181,6 +1196,7 @@ UDP_openSendConnection(UA_POSIXConnectionManager *pcm, const UA_KeyValueMap *par
     if(!conn) {
         UA_LOG_WARNING(el->eventLoop.logger, UA_LOGCATEGORY_NETWORK,
                        "UDP\t| Error allocating memory for the socket, closing");
+        UA_freeaddrinfo(info);
         return UA_STATUSCODE_BADOUTOFMEMORY;
     }
 
@@ -1291,8 +1307,8 @@ UDP_openReceiveConnection(UA_POSIXConnectionManager *pcm, const UA_KeyValueMap *
         char hn[UA_MAXHOSTNAME_LENGTH];
         if(hostStrings[i].length >= sizeof(hn))
             continue;
-        memcpy(hn, hostStrings[i].data, hostStrings->length);
-        hn[hostStrings->length] = '\0';
+        memcpy(hn, hostStrings[i].data, hostStrings[i].length);
+        hn[hostStrings[i].length] = '\0';
         UA_StatusCode rv =
             UDP_registerListenSockets(pcm, hn, *port, params, application,
                                       context, connectionCallback, validate);

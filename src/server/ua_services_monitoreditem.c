@@ -214,6 +214,18 @@ checkEventFilterParam(UA_Server *server, UA_Session *session,
 }
 #endif
 
+UA_Boolean
+VariableNode_externalDataSource(const UA_VariableNode *vn) {
+    switch(vn->valueSourceType) {
+    case UA_VALUESOURCETYPE_INTERNAL:
+        return (vn->valueSource.internal.notifications.onRead != NULL);
+    case UA_VALUESOURCETYPE_EXTERNAL:
+    case UA_VALUESOURCETYPE_CALLBACK:
+    default:
+        return true;
+    }
+}
+
 /* Verify and adjust the parameters of a MonitoredItem */
 static UA_StatusCode
 checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
@@ -280,26 +292,6 @@ checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
         }
     }
 
-    /* Read the minimum sampling interval for the variable. The sampling
-     * interval of the MonitoredItem must not be less than that. */
-    if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_VALUE) {
-        const UA_Node *node = UA_NODESTORE_GET(server, &mon->itemToMonitor.nodeId);
-        if(node) {
-            const UA_VariableNode *vn = &node->variableNode;
-            if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
-                /* Take into account if the publishing interval is used for sampling */
-                UA_Double samplingInterval = params->samplingInterval;
-                if(samplingInterval < 0 && mon->subscription)
-                    samplingInterval = mon->subscription->publishingInterval;
-                /* Adjust if smaller than the allowed minimum for the variable */
-                if(samplingInterval < vn->minimumSamplingInterval)
-                    params->samplingInterval = vn->minimumSamplingInterval;
-            }
-            UA_NODESTORE_RELEASE(server, node);
-        }
-    }
-
-
     /* A negative number indicates that the sampling interval is the publishing
      * interval of the Subscription. Note that the sampling interval selected
      * here remains also when the Subscription's publish interval is adjusted
@@ -307,13 +299,37 @@ checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
     if(mon->subscription && params->samplingInterval < 0.0)
         params->samplingInterval = mon->subscription->publishingInterval;
 
-    /* Adjust non-null sampling interval to lie within the configured limits */
-    if(params->samplingInterval != 0.0) {
+    /* If the value comes from an "external" data source, sampling is required.
+     * Otherwise, for samplingInterval == 0, we add a hook for every write. */
+    UA_Boolean extValueSource = false;
+
+    /* VariableNodes can lower-bound the permissible sampling interval */
+    UA_Double minimumSamplingInterval = 0.0;
+
+    /* Use hasValueSource and minimumSamplingInterval from a VariableNode */
+    if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_VALUE) {
+        const UA_Node *node = UA_NODESTORE_GET(server, &mon->itemToMonitor.nodeId);
+        if(node) {
+            if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
+                minimumSamplingInterval = node->variableNode.minimumSamplingInterval;
+                extValueSource = VariableNode_externalDataSource(&node->variableNode);
+            }
+            UA_NODESTORE_RELEASE(server, node);
+        }
+    }
+
+    /* Adjust non-null sampling interval to lie within the configured limits.
+     * Nodes with a value source require a >0.0 sampling interval. */
+    if(params->samplingInterval != 0.0 || extValueSource) {
         UA_BOUNDEDVALUE_SETWBOUNDS(server->config.samplingIntervalLimits,
                                    params->samplingInterval, params->samplingInterval);
         /* Check for NaN */
-        if(mon->parameters.samplingInterval != mon->parameters.samplingInterval)
+        if(params->samplingInterval != params->samplingInterval)
             params->samplingInterval = server->config.samplingIntervalLimits.min;
+
+        /* Minimum interval from the node */
+        if(params->samplingInterval < minimumSamplingInterval)
+            params->samplingInterval = minimumSamplingInterval;
     }
 
     /* Adjust the maximum queue size */
@@ -350,7 +366,7 @@ struct createMonContext {
     UA_LocalMonitoredItem *localMon; /* used if non-null */
 };
 
-static void
+void
 notifyMonitoredItem(UA_Server *server, UA_MonitoredItem *mon,
                     UA_ApplicationNotificationType type) {
     /* Nothing to do? */
@@ -400,6 +416,8 @@ notifyMonitoredItem(UA_Server *server, UA_MonitoredItem *mon,
                          &UA_TYPES[UA_TYPES_UINT32]);
     UA_Variant_setScalar(&notifyMonData[9].value, &mon->parameters.samplingInterval,
                          &UA_TYPES[UA_TYPES_DOUBLE]);
+    /* The filter is borrowed. Reset it without freeing the previous item's data. */
+    UA_Variant_init(&notifyMonData[10].value);
     if(mon->parameters.filter.encoding == UA_EXTENSIONOBJECT_DECODED ||
        mon->parameters.filter.encoding == UA_EXTENSIONOBJECT_DECODED_NODELETE) {
         UA_Variant_setScalar(&notifyMonData[10].value,
@@ -537,7 +555,7 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
                                  "Could not create a MonitoredItem "
                                  "with StatusCode %s",
                                  UA_StatusCode_name(result->statusCode));
-        UA_MonitoredItem_delete(server, newMon);
+        UA_MonitoredItem_delete(server, newMon, false);
         return;
     }
 
@@ -547,6 +565,10 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
 
     /* Register the Monitoreditem in the server and subscription */
     UA_MonitoredItem_register(server, newMon);
+
+    /* A register callback can reenter and delete the MonitoredItem. */
+    if(UA_MonitoredItem_isDeleting(newMon))
+        goto prepareResponse;
 
     UA_LOG_INFO_SUBSCRIPTION(server->config.logging, cmc->sub,
                              "MonitoredItem %" PRIi32 " | "
@@ -561,18 +583,21 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
     notifyMonitoredItem(server, newMon,
                         UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_CREATED);
 
+    /* Deletion from the CREATED callback has already queued delayed cleanup.
+     * Do not reactivate or sample the logically removed MonitoredItem. */
+    if(UA_MonitoredItem_isDeleting(newMon))
+        goto prepareResponse;
+
     /* Activate the MonitoredItem */
     result->statusCode = UA_MonitoredItem_setMonitoringMode(server, newMon,
                                                             request->monitoringMode);
     if(result->statusCode != UA_STATUSCODE_GOOD) {
-        /* Notify again if the MonitoringMode could not be set */
-        notifyMonitoredItem(server, newMon,
-                            UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-        UA_MonitoredItem_delete(server, newMon);
+        UA_MonitoredItem_delete(server, newMon, true);
         return;
     }
 
     /* Prepare the response */
+prepareResponse:
     result->revisedSamplingInterval = newMon->parameters.samplingInterval;
     result->revisedQueueSize = newMon->parameters.queueSize;
     result->monitoredItemId = newMon->monitoredItemId;
@@ -966,9 +991,7 @@ Operation_DeleteMonitoredItem(UA_Server *server, UA_Session *session, UA_Subscri
         *result = UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
         return;
     }
-    notifyMonitoredItem(server, mon,
-                        UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-    UA_MonitoredItem_delete(server, mon);
+    UA_MonitoredItem_delete(server, mon, true);
 }
 
 UA_Boolean
@@ -1010,18 +1033,13 @@ UA_StatusCode
 UA_Server_deleteMonitoredItem(UA_Server *server, UA_UInt32 monitoredItemId) {
     lockServer(server);
 
-    UA_Subscription *sub = server->adminSubscription;
-    UA_MonitoredItem *mon;
-    LIST_FOREACH(mon, &sub->monitoredItems, listEntry) {
-        if(mon->monitoredItemId == monitoredItemId)
-            break;
-    }
+    UA_MonitoredItem *mon =
+        UA_Subscription_getMonitoredItem(server->adminSubscription,
+                                         monitoredItemId);
 
     UA_StatusCode res = UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
     if(mon) {
-        notifyMonitoredItem(server, mon,
-                            UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-        UA_MonitoredItem_delete(server, mon);
+        UA_MonitoredItem_delete(server, mon, true);
         res = UA_STATUSCODE_GOOD;
     }
 

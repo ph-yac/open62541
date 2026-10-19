@@ -70,6 +70,7 @@ doc_src/
 /src_generated/
 **/build
 **/build_*
+**/build-*
 /cmake-build*
 /tools/certs/certs/*
 Pipfile
@@ -99,3 +100,14 @@ nbdist/
 .nb-gradle/
 tests/interop/node-opcua/node_modules/
 tests/interop/node-opcua/package-lock.json
+
+# Python virtualenv
+.venv/
+
+# Local doc-review helper (not part of the project)
+gen_review_docs.sh
+
+# Coverage artifacts
+*.gcov
+*.gcda
+*.gcno

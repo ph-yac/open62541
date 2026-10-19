@@ -9,6 +9,7 @@
 #include "ua_types_encoding_xml.h"
 
 #include <check.h>
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -850,7 +851,7 @@ START_TEST(UA_String_escapesimple_xml_encode) {
     status s = UA_encodeXml(&src, type, &buf, NULL);
     ck_assert_int_eq(s, UA_STATUSCODE_GOOD);
 
-    char *result = "<String>\b\th\"e\fl\nl\\o\r</String>";
+    char *result = "<String>\b\th&quot;e\fl\nl\\o\r</String>";
     buf.data[size] = 0; /* zero terminate */
     ck_assert_str_eq(result, (char*)buf.data);
     UA_ByteString_clear(&buf);
@@ -868,9 +869,48 @@ START_TEST(UA_String_escapeutf_xml_encode) {
     status s = UA_encodeXml(&src, type, &buf, NULL);
     ck_assert_int_eq(s, UA_STATUSCODE_GOOD);
 
-    char *result = "<String>he\\zsdl\alo€ \x26\x3A asdasd</String>";
+    char *result = "<String>he\\zsdl\alo€ &amp;\x3A asdasd</String>";
     buf.data[size] = 0; /* zero terminate */
     ck_assert_str_eq(result, (char*)buf.data);
+    UA_ByteString_clear(&buf);
+}
+END_TEST
+
+START_TEST(UA_String_markup_xml_encode) {
+    UA_String src = UA_STRING("a<b & c>d \"e\" 'f'");
+    const UA_DataType *type = &UA_TYPES[UA_TYPES_STRING];
+    size_t size = UA_calcSizeXml(&src, type, NULL);
+
+    UA_ByteString buf;
+    UA_ByteString_allocBuffer(&buf, size + 1);
+    status s = UA_encodeXml(&src, type, &buf, NULL);
+    ck_assert_int_eq(s, UA_STATUSCODE_GOOD);
+
+    char *result =
+        "<String>a&lt;b &amp; c&gt;d &quot;e&quot; &apos;f&apos;</String>";
+    buf.data[size] = 0;
+    ck_assert_str_eq(result, (char*)buf.data);
+    UA_ByteString_clear(&buf);
+}
+END_TEST
+
+START_TEST(UA_String_markup_xml_roundtrip) {
+    UA_String src = UA_STRING("a<b & c>d \"e\" 'f'");
+    const UA_DataType *type = &UA_TYPES[UA_TYPES_STRING];
+    size_t size = UA_calcSizeXml(&src, type, NULL);
+
+    UA_ByteString buf;
+    UA_ByteString_allocBuffer(&buf, size);
+    status s = UA_encodeXml(&src, type, &buf, NULL);
+    ck_assert_int_eq(s, UA_STATUSCODE_GOOD);
+
+    UA_String out;
+    UA_String_init(&out);
+    s = UA_decodeXml(&buf, &out, type, NULL);
+    ck_assert_int_eq(s, UA_STATUSCODE_GOOD);
+    ck_assert(UA_String_equal(&src, &out));
+
+    UA_String_clear(&out);
     UA_ByteString_clear(&buf);
 }
 END_TEST
@@ -2153,6 +2193,20 @@ END_TEST
 
 
 // ---------------------------DECODE-------------------------------------
+
+#if SIZE_MAX > UINT_MAX
+START_TEST(UA_oversize_input_xml_decode) {
+    UA_Byte dummy = 0;
+    UA_ByteString buf = {(size_t)UINT_MAX + 1, &dummy};
+    UA_Boolean out = false;
+
+    UA_StatusCode retval =
+        UA_decodeXml(&buf, &out, &UA_TYPES[UA_TYPES_BOOLEAN], NULL);
+
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADDECODINGERROR);
+}
+END_TEST
+#endif
 
 
 /* Boolean */
@@ -4270,6 +4324,8 @@ static Suite *testSuite_builtin_xml(void) {
     tcase_add_test(tc_xml_encode, UA_String_Null_xml_encode);
     tcase_add_test(tc_xml_encode, UA_String_escapesimple_xml_encode);
     tcase_add_test(tc_xml_encode, UA_String_escapeutf_xml_encode);
+    tcase_add_test(tc_xml_encode, UA_String_markup_xml_encode);
+    tcase_add_test(tc_xml_encode, UA_String_markup_xml_roundtrip);
     tcase_add_test(tc_xml_encode, UA_String_special_xml_encode);
 
     tcase_add_test(tc_xml_encode, UA_DateTime_xml_encode);
@@ -4330,6 +4386,9 @@ static Suite *testSuite_builtin_xml(void) {
 
     TCase *tc_xml_decode = tcase_create("xml_decode");
 
+#if SIZE_MAX > UINT_MAX
+    tcase_add_test(tc_xml_decode, UA_oversize_input_xml_decode);
+#endif
     tcase_add_test(tc_xml_decode, UA_Boolean_true_xml_decode);
     tcase_add_test(tc_xml_decode, UA_Boolean_false_xml_decode);
 

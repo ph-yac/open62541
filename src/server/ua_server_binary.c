@@ -113,11 +113,15 @@ deleteServerSecureChannel(UA_BinaryProtocolManager *bpm,
     /* Clean up the SecureChannel. This is the only place where
      * UA_SecureChannel_clear must be called within the server code-base.
      *
-     * First detach all Sessions from the SecureChannel. This also removes
-     * outstanding Publish requests whose RequestId is valid only for the
-     * SecureChannel. */
-    while(channel->sessions)
-        UA_Session_detachFromSecureChannel(server, channel->sessions);
+     * Activated sessions are detached so they can be re-activated on a new
+     * channel. Non-activated sessions are deleted (Part 4, §5.6.3). */
+    while(channel->sessions) {
+        UA_Session *session = channel->sessions;
+        if(!session->activated)
+            UA_Session_remove(server, session, UA_SHUTDOWNREASON_PURGE);
+        else
+            UA_Session_detachFromSecureChannel(server, session);
+    }
 
     /* Detach the channel from the server list */
     TAILQ_REMOVE(&server->channels, channel, serverEntry);
@@ -225,9 +229,21 @@ processHEL(UA_Server *server, UA_SecureChannel *channel, const UA_ByteString *ms
     if(retval != UA_STATUSCODE_GOOD)
         return retval;
 
-    /* Currently not checked */
-    UA_String_copy(&helloMessage.endpointUrl, &channel->endpointUrl);
+    /* HEL has no fields after the EndpointUrl. */
+    if(offset != msg->length) {
+        UA_String_clear(&helloMessage.endpointUrl);
+        return UA_STATUSCODE_BADDECODINGERROR;
+    }
+    /* Part 6, 7.1.2.3: the EndpointUrl shall be less than 4096 bytes. The
+     * resource it identifies is currently not checked. */
+    if(helloMessage.endpointUrl.length >= 4096) {
+        UA_String_clear(&helloMessage.endpointUrl);
+        return UA_STATUSCODE_BADTCPENDPOINTURLINVALID;
+    }
+    retval = UA_String_copy(&helloMessage.endpointUrl, &channel->endpointUrl);
     UA_String_clear(&helloMessage.endpointUrl);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
 
     /* Parameterize the connection. The TcpHelloMessage casts to a
      * TcpAcknowledgeMessage. */
@@ -611,26 +627,39 @@ createServerSecureChannel(UA_BinaryProtocolManager *bpm, UA_ConnectionManager *c
     connConfig.localMaxChunkCount = config->tcpMaxChunks;
     connConfig.remoteMaxChunkCount = config->tcpMaxChunks;
 
-    /* Set 64kB buffer size if not configured */
-    if(connConfig.recvBufferSize == 0)
-        connConfig.recvBufferSize = 1 << 16; /* 64kB */
-    if(connConfig.sendBufferSize == 0)
-        connConfig.sendBufferSize = 1 << 16; /* 64kB */
-
     /* Further constrain the bufsize if the ConnectionManager has static rx/tx
-     * buffers configured */
+     * buffers configured. Also applies when tcpBufSize is unset (0), so that
+     * chunks always fit into the static buffers. Never constrain below 8192
+     * bytes: the transport buffer must be at least that size to fit a single
+     * MessageChunk (OPC UA Part 6 v1.05.07 §6.7.1 and §6.7.2.4). */
     const UA_UInt32 *bufSize = (const UA_UInt32 *)
         UA_KeyValueMap_getScalar(&cm->eventSource.params,
                                  UA_QUALIFIEDNAME(0, "recv-bufsize"),
                                  &UA_TYPES[UA_TYPES_UINT32]);
-    if(bufSize && *bufSize < connConfig.recvBufferSize)
+    if(bufSize && *bufSize >= 8192 &&
+       (connConfig.recvBufferSize == 0 || *bufSize < connConfig.recvBufferSize))
         connConfig.recvBufferSize = *bufSize;
     bufSize = (const UA_UInt32 *)
         UA_KeyValueMap_getScalar(&cm->eventSource.params,
                                  UA_QUALIFIEDNAME(0, "send-bufsize"),
                                  &UA_TYPES[UA_TYPES_UINT32]);
-    if(bufSize && *bufSize < connConfig.sendBufferSize)
+    if(bufSize && *bufSize >= 8192 &&
+       (connConfig.sendBufferSize == 0 || *bufSize < connConfig.sendBufferSize))
         connConfig.sendBufferSize = *bufSize;
+
+    /* Set upper bounds if not configured */
+    if(connConfig.recvBufferSize == 0)
+        connConfig.recvBufferSize = 1 << 16; /* 64kB */
+    if(connConfig.sendBufferSize == 0)
+        connConfig.sendBufferSize = 1 << 16; /* 64kB */
+    if(connConfig.localMaxMessageSize == 0)
+        connConfig.localMaxMessageSize = 1 << 29; /* 512 MB */
+    if(connConfig.remoteMaxMessageSize == 0)
+        connConfig.remoteMaxMessageSize = 1 << 29; /* 512 MB */
+    if(connConfig.localMaxChunkCount == 0)
+        connConfig.localMaxChunkCount = 1 << 14; /* 16384 */
+    if(connConfig.remoteMaxChunkCount == 0)
+        connConfig.remoteMaxChunkCount = 1 << 14; /* 16384 */
 
     /* Set up the new SecureChannel */
     UA_SecureChannel_init(channel);
@@ -705,7 +734,16 @@ addDiscoveryUrl(UA_Server *server, const UA_String hostname, UA_UInt16 port) {
     }
 }
 
-/* Callback of a TCP socket (server socket or an active connection) */
+/* Callback of a TCP socket (server socket or an active connection).
+ *
+ * The connectionContext points to one of two possible structures. A
+ * double-pointer is used here, so we get re-assign the context to a different
+ * memory location within the callback.
+ *
+ * - The server socket (listening) has an initial NULL context and then gets
+ *   assigned to the appropriate UA_ServerConnection slot.
+ * - The connection socket (active) initially points to the UA_ServerConnection
+ *   slot and then gets assigned to the new SecureChannel instance. */
 static void
 serverNetworkCallbackLocked(UA_ConnectionManager *cm, uintptr_t connectionId,
                             void *application, void **connectionContext,
@@ -756,6 +794,7 @@ serverNetworkCallbackLocked(UA_ConnectionManager *cm, uintptr_t connectionId,
         return;
     }
 
+    /* Either sc or channel applies. See the comment before this function. */
     UA_ServerConnection *sc = (UA_ServerConnection*)*connectionContext;
     UA_SecureChannel *channel = (UA_SecureChannel*)*connectionContext;
     UA_Boolean serverSocket = (sc >= bpm->serverConnections &&

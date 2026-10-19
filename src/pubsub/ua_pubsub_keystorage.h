@@ -124,6 +124,9 @@ typedef struct UA_PubSubSKSConfig {
     UA_Server_sksPullRequestCallback userNotifyCallback;
     void *context;
     UA_UInt32 reqId;
+    UA_Boolean requestActive;
+    UA_Client *client;
+    void *clientContext;
 } UA_PubSubSKSConfig;
 
 /* Holds all info and keys related to one SecurityGroup */
@@ -172,12 +175,20 @@ struct UA_PubSubKeyStorage {
      * security group */
     UA_UInt64 callBackId;
 
+    /* One-shot timer that starts the next pull from a remote SKS. */
+    UA_UInt64 refetchCallbackId;
+
     /* Sks related information to connect with SKS server and fetch security
      * keys */
     UA_PubSubSKSConfig sksConfig;
 
+    /* The asynchronous SKS client retains a pointer to this storage until its
+     * shutdown callback has completed. */
+    UA_Boolean pendingDelete;
+
     /* Pointer to the key storage list */
     LIST_ENTRY(UA_PubSubKeyStorage) keyStorageList;
+    UA_Boolean listed;
 
 };
 
@@ -215,6 +226,10 @@ void
 UA_PubSubKeyStorage_delete(UA_PubSubManager *psm,
                            UA_PubSubKeyStorage *keyStorage);
 
+void
+UA_PubSubKeyStorage_deleteNow(UA_PubSubManager *psm,
+                              UA_PubSubKeyStorage *keyStorage);
+
 /**
  * @brief Initializes an empty Keystorage for the SecurityGroupId and add it to the Server
  * KeyStorageList
@@ -251,6 +266,13 @@ UA_PubSubKeyStorage_clearKeyList(UA_PubSubKeyStorage *ks);
 UA_StatusCode
 UA_PubSubKeyStorage_addSecurityKeys(UA_PubSubKeyStorage *keyStorage, size_t keysSize,
                                     UA_ByteString *keys, UA_UInt32 currentKeyId);
+
+/* Validate complete SKS key-material items against the configured PubSub
+ * SecurityPolicy before they are installed in the live key list. */
+UA_StatusCode
+UA_PubSubKeyStorage_validateKeyMaterial(const UA_PubSubKeyStorage *keyStorage,
+                                        size_t keysSize,
+                                        const UA_ByteString *keys);
 
 /* Fetch the key from the list and set it as the current key */
 UA_StatusCode
@@ -333,6 +355,10 @@ UA_PubSubKeyStorage_keyRolloverCallback(UA_PubSubManager *psm,
 void
 UA_PubSubKeyStorage_detachKeyStorage(UA_PubSubManager *psm,
                                      UA_PubSubKeyStorage *keyStorage);
+
+UA_StatusCode
+UA_PubSubKeyStorage_validateGetSecurityKeysResponse(
+    const UA_CallResponse *response);
 
 /* Calls get SecurityKeys Method and Store the returned keys into KeyStorage */
 UA_StatusCode

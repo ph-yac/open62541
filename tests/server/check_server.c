@@ -9,10 +9,13 @@
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 #include <open62541/types.h>
+#include <open62541/transport_generated.h>
 
 #include "server/ua_server_internal.h"
 #include "server/ua_services.h"
 #include "test_helpers.h"
+#include "ua_types_encoding_binary.h"
+#include "testing_networklayers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,10 +25,15 @@
 
 static UA_Server *server = NULL;
 
+#define MAX_NOTIFICATIONS 16
+static UA_ApplicationNotificationType receivedNotifications[MAX_NOTIFICATIONS];
+static size_t receivedNotificationsCount = 0;
+
 static void
 serverNotificationCallback(UA_Server *server, UA_ApplicationNotificationType type,
                            const UA_KeyValueMap payload) {
-
+    if(receivedNotificationsCount < MAX_NOTIFICATIONS)
+        receivedNotifications[receivedNotificationsCount++] = type;
 }
 
 static void setup(void) {
@@ -33,6 +41,7 @@ static void setup(void) {
     UA_ServerConfig *cfg = UA_Server_getConfig(server);
     cfg->globalNotificationCallback = serverNotificationCallback;
     ck_assert(server != NULL);
+    receivedNotificationsCount = 0;
 }
 
 static void teardown(void) {
@@ -491,8 +500,9 @@ START_TEST(checkMultipleNamespaces) {
 } END_TEST
 
 START_TEST(checkServerLifecycleCallbackNotification) {
-    /* Just verify that the notification callback is registered and
-     * doesn't crash during startup/shutdown */
+    /* Verify that the notification callback fires the distinct STARTED,
+     * STOPPING and STOPPED notifications -- not STOPPING twice -- during a
+     * normal startup/shutdown cycle. */
     UA_StatusCode ret = UA_Server_run_startup(server);
     ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
 
@@ -505,6 +515,11 @@ START_TEST(checkServerLifecycleCallbackNotification) {
 
     ret = UA_Server_run_shutdown(server);
     ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
+
+    ck_assert_uint_eq(receivedNotificationsCount, 3);
+    ck_assert_int_eq(receivedNotifications[0], UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STARTED);
+    ck_assert_int_eq(receivedNotifications[1], UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING);
+    ck_assert_int_eq(receivedNotifications[2], UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPED);
 } END_TEST
 
 START_TEST(checkServerAddVariableTypeNode) {
@@ -608,6 +623,139 @@ START_TEST(checkServerAddObjectTypeNode) {
     ck_assert_int_eq(nc, UA_NODECLASS_OBJECTTYPE);
 } END_TEST
 
+START_TEST(checkServerConfig_returnsLivePointer) {
+    UA_ServerConfig *config1 = UA_Server_getConfig(server);
+    UA_ServerConfig *config2 = UA_Server_getConfig(server);
+    ck_assert_ptr_ne(config1, NULL);
+    ck_assert_ptr_eq(config1, config2);
+
+    /* Mutations through the returned pointer must persist */
+    UA_UInt32 original = config1->maxNodesPerRead;
+    config1->maxNodesPerRead = original + 17;
+    ck_assert_uint_eq(UA_Server_getConfig(server)->maxNodesPerRead,
+                      original + 17);
+    config1->maxNodesPerRead = original;
+} END_TEST
+
+static int callbackCounter = 0;
+static void testRepeatedCallback(UA_Server *s, void *data) {
+    (void)s; (void)data;
+    callbackCounter++;
+}
+
+START_TEST(checkCallbackManagement) {
+    UA_UInt64 callbackId = 0;
+
+    UA_StatusCode ret = UA_Server_run_startup(server);
+    ck_assert_int_eq(ret, UA_STATUSCODE_GOOD);
+
+    ret = UA_Server_addRepeatedCallback(server, testRepeatedCallback, NULL,
+                                        1000.0, &callbackId);
+    ck_assert_int_eq(ret, UA_STATUSCODE_GOOD);
+    ck_assert(callbackId != 0);
+
+    ret = UA_Server_changeRepeatedCallbackInterval(server, callbackId, 2000.0);
+    ck_assert_int_eq(ret, UA_STATUSCODE_GOOD);
+
+    UA_Server_removeCallback(server, callbackId);
+
+    UA_Server_removeCallback(server, 99999);
+
+    ret = UA_Server_run_shutdown(server);
+    ck_assert_int_eq(ret, UA_STATUSCODE_GOOD);
+} END_TEST
+
+static unsigned closeCount;
+static UA_StatusCode
+closeConnection(UA_ConnectionManager *cm, uintptr_t connectionId) {
+    (void)cm;
+    ck_assert_uint_eq(connectionId, 2);
+    closeCount++;
+    return UA_STATUSCODE_GOOD;
+}
+
+static void
+checkHello(size_t urlLength, size_t trailing, UA_UInt32 version, UA_StatusCode expected) {
+    UA_ConnectionManager *cm = TestConnectionManager_new("tcp", NULL);
+    ck_assert_ptr_ne(cm, NULL);
+    cm->eventSource.eventLoop = UA_Server_getConfig(server)->eventLoop;
+    cm->closeConnection = closeConnection;
+    UA_ServerComponent *bpm = getServerComponentByName(server, UA_STRING("binary"));
+    ck_assert_ptr_ne(bpm, NULL);
+    closeCount = 0;
+    void *listener = NULL;
+    serverNetworkCallback(cm, 1, bpm, &listener, UA_CONNECTIONSTATE_ESTABLISHED,
+                          &UA_KEYVALUEMAP_NULL, UA_BYTESTRING_NULL);
+    ck_assert_ptr_ne(listener, NULL);
+
+    UA_TcpHelloMessage hello;
+    UA_TcpHelloMessage_init(&hello);
+    hello.protocolVersion = version;
+    hello.receiveBufferSize = hello.sendBufferSize = 65536;
+    ck_assert_uint_eq(UA_ByteString_allocBuffer(&hello.endpointUrl, urlLength),
+                      UA_STATUSCODE_GOOD);
+    memset(hello.endpointUrl.data, 'x', urlLength);
+    UA_ByteString body = UA_BYTESTRING_NULL;
+    ck_assert_uint_eq(UA_encodeBinary(&hello, &UA_TRANSPORT[UA_TRANSPORT_TCPHELLOMESSAGE],
+                                     &body, NULL), UA_STATUSCODE_GOOD);
+    UA_TcpHelloMessage_clear(&hello);
+    UA_ByteString frame;
+    ck_assert_uint_eq(UA_ByteString_allocBuffer(&frame, 8 + body.length + trailing),
+                      UA_STATUSCODE_GOOD);
+    UA_TcpMessageHeader header = {UA_MESSAGETYPE_HEL + UA_CHUNKTYPE_FINAL,
+                                  (UA_UInt32)frame.length};
+    UA_ByteString headerBuf = {8, frame.data};
+    ck_assert_uint_eq(UA_encodeBinary(&header, &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER],
+                                     &headerBuf, NULL), UA_STATUSCODE_GOOD);
+    memcpy(frame.data + 8, body.data, body.length);
+    memset(frame.data + 8 + body.length, 0xab, trailing);
+    UA_ByteString_clear(&body);
+
+    void *connection = listener;
+    serverNetworkCallback(cm, 2, bpm, &connection, UA_CONNECTIONSTATE_ESTABLISHED,
+                          &UA_KEYVALUEMAP_NULL, frame);
+    const UA_ByteString *response = TestConnectionManager_getLastSent(cm);
+    size_t offset = 0;
+    ck_assert_uint_eq(UA_decodeBinaryInternal(response, &offset, &header,
+                      &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL), UA_STATUSCODE_GOOD);
+    if(expected == UA_STATUSCODE_GOOD) {
+        ck_assert_uint_eq(header.messageTypeAndChunkType, UA_MESSAGETYPE_ACK + UA_CHUNKTYPE_FINAL);
+        UA_TcpAcknowledgeMessage ack;
+        ck_assert_uint_eq(UA_decodeBinaryInternal(response, &offset, &ack,
+                          &UA_TRANSPORT[UA_TRANSPORT_TCPACKNOWLEDGEMESSAGE], NULL), UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(ack.protocolVersion, 0);
+        ck_assert_uint_eq(closeCount, 0);
+    } else {
+        ck_assert_uint_eq(header.messageTypeAndChunkType, UA_MESSAGETYPE_ERR + UA_CHUNKTYPE_FINAL);
+        UA_TcpErrorMessage error;
+        ck_assert_uint_eq(UA_decodeBinaryInternal(response, &offset, &error,
+                          &UA_TRANSPORT[UA_TRANSPORT_TCPERRORMESSAGE], NULL), UA_STATUSCODE_GOOD);
+        ck_assert_uint_eq(error.error, expected);
+        ck_assert_uint_eq(closeCount, 1);
+        UA_TcpErrorMessage_clear(&error);
+    }
+    serverNetworkCallback(cm, 2, bpm, &connection, UA_CONNECTIONSTATE_CLOSING,
+                          &UA_KEYVALUEMAP_NULL, UA_BYTESTRING_NULL);
+    serverNetworkCallback(cm, 1, bpm, &listener, UA_CONNECTIONSTATE_CLOSING,
+                          &UA_KEYVALUEMAP_NULL, UA_BYTESTRING_NULL);
+    cm->eventSource.free(&cm->eventSource);
+    UA_ByteString_clear(&frame);
+}
+
+START_TEST(helloEndpointUrlLimit) {
+    checkHello(32, 0, 0, UA_STATUSCODE_GOOD);
+    checkHello(4095, 0, 0, UA_STATUSCODE_GOOD);
+    checkHello(4096, 0, 0, UA_STATUSCODE_BADTCPENDPOINTURLINVALID);
+    checkHello(4097, 0, 0, UA_STATUSCODE_BADTCPENDPOINTURLINVALID);
+    checkHello(5000, 0, 0, UA_STATUSCODE_BADTCPENDPOINTURLINVALID);
+    checkHello(32, 0, 0xdeadbeef, UA_STATUSCODE_GOOD);
+} END_TEST
+
+START_TEST(helloTrailingData) {
+    checkHello(32, 1, 0, UA_STATUSCODE_BADDECODINGERROR);
+    checkHello(32, 8, 0, UA_STATUSCODE_BADDECODINGERROR);
+} END_TEST
+
 int main(void) {
     Suite *s = suite_create("server");
 
@@ -617,6 +765,8 @@ int main(void) {
     tcase_add_test(tc_call, checkGetNamespaceByName);
     tcase_add_test(tc_call, checkGetNamespaceById);
     tcase_add_test(tc_call, checkServer_run);
+    tcase_add_test(tc_call, helloEndpointUrlLimit);
+    tcase_add_test(tc_call, helloTrailingData);
     suite_add_tcase(s, tc_call);
 
     TCase *tc_ext = tcase_create("server - extended");
@@ -628,6 +778,7 @@ int main(void) {
     tcase_add_test(tc_ext, checkServerReadDescription);
     tcase_add_test(tc_ext, checkServerReadWriteRank);
     tcase_add_test(tc_ext, checkServerReadNodeId);
+
     tcase_add_test(tc_ext, checkServerAddRemoveNamespace);
     tcase_add_test(tc_ext, checkServerWriteValue);
     tcase_add_test(tc_ext, checkServerAddObjectNode);
@@ -638,6 +789,7 @@ int main(void) {
     tcase_add_test(tc_ext, checkServerAddReference);
     tcase_add_test(tc_ext, checkServerReadDataType);
     tcase_add_test(tc_ext, checkServerRepeatedCallback);
+    tcase_add_test(tc_ext, checkCallbackManagement);
     tcase_add_test(tc_ext, checkForEachChildNodeCall);
     tcase_add_test(tc_ext, checkForEachChildNodeCall_abort);
     tcase_add_test(tc_ext, checkForEachChildNodeCall_invalidNode);
@@ -649,6 +801,7 @@ int main(void) {
     tcase_add_test(tc_ext, checkServerAddDataTypeNode);
     tcase_add_test(tc_ext, checkServerAddReferenceTypeNode);
     tcase_add_test(tc_ext, checkServerAddObjectTypeNode);
+    tcase_add_test(tc_ext, checkServerConfig_returnsLivePointer);
     suite_add_tcase(s, tc_ext);
 
     SRunner *sr = srunner_create(s);

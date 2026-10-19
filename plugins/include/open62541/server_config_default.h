@@ -33,13 +33,20 @@ UA_ConnectionConfig UA_ConnectionConfig_default;
  * endpoint with the security policy ``SecurityPolicy#None`` to the server.
  * If the port is set to 0, it will be dynamically assigned.
  * A server certificate may be supplied but is optional.
- * Additionally you can define a custom buffer size for send and receive buffer.
+ *
+ * Note: only ``recvBufferSize`` is used; it is stored in ``config->tcpBufSize``
+ * and drives both ``connConfig.recvBufferSize`` and ``connConfig.sendBufferSize``.
+ * ``sendBufferSize`` is kept in the signature for compatibility but ignored.
+ * A value of 0 lets the underlying ConnectionManager choose its default
+ * (architecture-dependent, see the recv-bufsize/send-bufsize CM parameters).
  *
  * @param portNumber The port number for the tcp network layer
  * @param certificate Optional certificate for the server endpoint. Can be
  *        ``NULL``.
- * @param sendBufferSize The size in bytes for the network send buffer
- * @param recvBufferSize The size in bytes for the network receive buffer
+ * @param sendBufferSize Ignored (kept for compatibility); pass the same value
+ *        as ``recvBufferSize``.
+ * @param recvBufferSize The size in bytes for the network send AND receive
+ *        buffer (0 = architecture-dependent default).
  *
  */
 UA_EXPORT UA_StatusCode
@@ -231,6 +238,10 @@ UA_ServerConfig_addSecurityPolicyAes256Sha256RsaPss(UA_ServerConfig *config,
 /* Adds the security policy ``SecurityPolicy#EccNistP256`` to the server. A
  * server certificate may be supplied but is optional.
  *
+ * Deprecated (OPC UA Part 7): superseded by the AEAD policies
+ * ``EccNistP256_AesGcm`` / ``EccNistP256_ChaChaPoly``. No longer part of the
+ * default policy set; call this function to add it explicitly.
+ *
  * Certificate verification should be configured before calling this
  * function. See PKI plugin.
  *
@@ -243,16 +254,45 @@ UA_ServerConfig_addSecurityPolicyEccNistP256(UA_ServerConfig *config,
                                                      const UA_ByteString *certificate,
                                                      const UA_ByteString *privateKey);
 
+/* Adds the security policy ``SecurityPolicy#EccNistP256_AesGcm`` to the
+ * server. A server certificate may be supplied but is optional.
+ *
+ * Certificate verification should be configured before calling this
+ * function. See PKI plugin.
+ *
+ * @param config The configuration to manipulate
+ * @param certificate The server certificate.
+ * @param privateKey The private key that corresponds to the certificate.
+ */
+UA_EXPORT UA_StatusCode
+UA_ServerConfig_addSecurityPolicyEccNistP256AesGcm(UA_ServerConfig *config,
+                                                    const UA_ByteString *certificate,
+                                                    const UA_ByteString *privateKey);
+
+UA_EXPORT UA_StatusCode
+UA_ServerConfig_addSecurityPolicyEccNistP256ChaChaPoly(UA_ServerConfig *config,
+                                                       const UA_ByteString *certificate,
+                                                       const UA_ByteString *privateKey);
+
+/* Deprecated (OPC UA Part 7): superseded by the AEAD policies
+ * ``EccNistP384_AesGcm`` / ``EccNistP384_ChaChaPoly``. No longer part of the
+ * default policy set; call this function to add it explicitly. */
 UA_EXPORT UA_StatusCode
 UA_ServerConfig_addSecurityPolicyEccNistP384(UA_ServerConfig *config,
                                              const UA_ByteString *certificate,
                                              const UA_ByteString *privateKey);
 
+/* Deprecated (OPC UA Part 7): superseded by the AEAD policies
+ * ``EccBrainpoolP256r1_AesGcm`` / ``EccBrainpoolP256r1_ChaChaPoly``. No longer
+ * part of the default policy set; call this function to add it explicitly. */
 UA_EXPORT UA_StatusCode
 UA_ServerConfig_addSecurityPolicyEccBrainpoolP256r1(UA_ServerConfig *config,
                                                     const UA_ByteString *certificate,
                                                     const UA_ByteString *privateKey);
 
+/* Deprecated (OPC UA Part 7): superseded by the AEAD policies
+ * ``EccBrainpoolP384r1_AesGcm`` / ``EccBrainpoolP384r1_ChaChaPoly``. No longer
+ * part of the default policy set; call this function to add it explicitly. */
 UA_EXPORT UA_StatusCode
 UA_ServerConfig_addSecurityPolicyEccBrainpoolP384r1(UA_ServerConfig *config,
                                                     const UA_ByteString *certificate,

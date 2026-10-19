@@ -84,6 +84,8 @@ typedef struct {
     /* Callback to close all SecureChannels after calling applyChanges
      * and freeing the transaction. */
     UA_DelayedCallback dc;
+    /* Prevent duplicate enqueue of the embedded dc (use-after-free). */
+    UA_Boolean applyChangesQueued;
 } UA_GDSTransaction;
 
 UA_StatusCode
@@ -234,6 +236,9 @@ struct UA_Server {
     /* For bootstrapping, omit some consistency checks, creating a reference to
      * the parent and member instantiation */
     UA_Boolean bootstrapNS0;
+
+    /* Current depth while recursively instantiating node children */
+    size_t nodeInstantiationDepth;
 
     /* Subscriptions */
 #ifdef UA_ENABLE_SUBSCRIPTIONS
@@ -606,8 +611,7 @@ getDefaultEncryptedSecurityPolicy(UA_Server *server,
 /* If the channel is non-NULL, then only compatible endpoints are returned.
  * Depending on ECC/RSA for the SecurityPolicy of the existing channel. */
 UA_StatusCode
-setCurrentEndPointsArray(UA_Server *server, UA_SecureChannel *channel,
-                         const UA_String endpointUrl,
+setCurrentEndpointsArray(UA_Server *server, const UA_String endpointUrl,
                          UA_String *profileUris, size_t profileUrisSize,
                          UA_EndpointDescription **arr, size_t *arrSize);
 
@@ -650,6 +654,11 @@ UA_ServerComponent * UA_BinaryProtocolManager_new(UA_Server *server);
 
 #ifdef UA_ENABLE_PUBSUB
 UA_ServerComponent * UA_PubSubManager_new(UA_Server *server);
+#endif
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+/* AuthenticationToken of the session prepared by the message fuzzer. */
+extern UA_NodeId unsafe_fuzz_authenticationToken;
 #endif
 
 /***********/
@@ -774,6 +783,13 @@ struct BrowseOpts {
 void
 Operation_Browse(UA_Server *server, UA_Session *session, const UA_UInt32 *maxrefs,
                  const UA_BrowseDescription *descr, UA_BrowseResult *result);
+
+/* External data either from a datasource callback or with a _beforeRead
+ * callback where fresh values get switched in on demand. Variables with an
+ * external data source require monitoring with a sampling interval. As we
+ * cannot just hook into the write service to get all changes. */
+UA_Boolean
+VariableNode_externalDataSource(const UA_VariableNode *vn);
 
 /************/
 /* AddNodes */

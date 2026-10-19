@@ -9,6 +9,7 @@
 
 #include "server/ua_server_internal.h"
 #include "client/ua_client_internal.h"
+#include "server/ua_services.h"
 #include "../encryption/certificates.h"
 
 #include <fcntl.h>
@@ -28,8 +29,12 @@
 #include <sys/stat.h>
 #endif
 
-// set register timeout to 1 second so we are able to test it.
-#define registerTimeout 4
+// Registration cleanup timeout (seconds). Kept generous so the registered
+// entry cannot age out between registering and the FindServers check under slow
+// execution (e.g. valgrind), where re-registration may transiently fail. The
+// dedicated timeout test still drives expiry via UA_fakeSleep(100000*checkWait),
+// which scales with this value and stays well beyond the timeout.
+#define registerTimeout 60
 // cleanup is only triggered every 10 seconds, thus wait a bit longer to check
 #define checkWait registerTimeout + 11
 
@@ -193,11 +198,7 @@ registerServer(void) {
     privateKey.data = KEY_DER_DATA;
 
     UA_ClientConfig cc;
-    memset(&cc, 0, sizeof(UA_ClientConfig));
-    UA_ClientConfig_setDefaultEncryption(&cc, certificate, privateKey, NULL, 0, NULL, 0);
-    UA_CertificateGroup_AcceptAll(&cc.certificateVerification);
-    cc.eventLoop->dateTime_now = UA_DateTime_now_fake;
-    cc.eventLoop->dateTime_nowMonotonic = UA_DateTime_now_fake;
+    UA_ClientConfig_newForUnitTestWithEncryption(&cc, certificate, privateKey);
 
     *running_register = false;
     THREAD_JOIN(server_thread_register);
@@ -224,11 +225,7 @@ unregisterServer(void) {
     privateKey.data = KEY_DER_DATA;
 
     UA_ClientConfig cc;
-    memset(&cc, 0, sizeof(UA_ClientConfig));
-    UA_ClientConfig_setDefaultEncryption(&cc, certificate, privateKey, NULL, 0, NULL, 0);
-    UA_CertificateGroup_AcceptAll(&cc.certificateVerification);
-    cc.eventLoop->dateTime_now = UA_DateTime_now_fake;
-    cc.eventLoop->dateTime_nowMonotonic = UA_DateTime_now_fake;
+    UA_ClientConfig_newForUnitTestWithEncryption(&cc, certificate, privateKey);
 
     *running_register = false;
     THREAD_JOIN(server_thread_register);
@@ -269,11 +266,7 @@ Server_register_semaphore(void) {
     privateKey.data = KEY_DER_DATA;
 
     UA_ClientConfig cc;
-    memset(&cc, 0, sizeof(UA_ClientConfig));
-    UA_ClientConfig_setDefaultEncryption(&cc, certificate, privateKey, NULL, 0, NULL, 0);
-    UA_CertificateGroup_AcceptAll(&cc.certificateVerification);
-    cc.eventLoop->dateTime_now = UA_DateTime_now_fake;
-    cc.eventLoop->dateTime_nowMonotonic = UA_DateTime_now_fake;
+    UA_ClientConfig_newForUnitTestWithEncryption(&cc, certificate, privateKey);
 
     *running_register = false;
     THREAD_JOIN(server_thread_register);
@@ -368,6 +361,56 @@ FindAndCheck(const UA_String expectedUris[], size_t expectedUrisSize,
     UA_Client_disconnect(client);
     UA_Client_delete(client);
     return found;
+}
+
+static UA_Boolean
+FindAndCheckDiscoveryUrls(const char *requestedEndpointUrl,
+                          size_t expectedSize) {
+    UA_Client *client = UA_Client_newForUnitTest();
+
+    UA_StatusCode retval = UA_Client_connect(client, requestedEndpointUrl);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+        return false;
+    }
+
+    UA_FindServersRequest request;
+    UA_FindServersRequest_init(&request);
+    request.endpointUrl = UA_STRING((char*)(uintptr_t)requestedEndpointUrl);
+
+    UA_ApplicationDescription *applicationDescriptionArray = NULL;
+    size_t applicationDescriptionArraySize = 0;
+
+    UA_FindServersResponse response;
+    __UA_Client_Service(client, &request, &UA_TYPES[UA_TYPES_FINDSERVERSREQUEST],
+                        &response, &UA_TYPES[UA_TYPES_FINDSERVERSRESPONSE]);
+    ck_assert_uint_eq(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+
+    applicationDescriptionArray = response.servers;
+    applicationDescriptionArraySize = response.serversSize;
+
+    UA_Boolean ok = true;
+    UA_String requested = UA_STRING((char*)(uintptr_t)requestedEndpointUrl);
+
+    if(applicationDescriptionArraySize != expectedSize)
+        ok = false;
+
+    for(size_t i = 0; ok && i < applicationDescriptionArraySize; i++) {
+        UA_ApplicationDescription *ad = &applicationDescriptionArray[i];
+        if(ad->discoveryUrlsSize != 1) {
+            ok = false;
+            break;
+        }
+        if(!UA_String_equal(&ad->discoveryUrls[0], &requested)) {
+            ok = false;
+            break;
+        }
+    }
+
+    UA_FindServersResponse_clear(&response);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+    return ok;
 }
 
 #ifdef UA_ENABLE_DISCOVERY_MULTICAST
@@ -622,6 +665,66 @@ START_TEST(Server_new_shutdown_delete) {
 }
 END_TEST
 
+START_TEST(Server_getEndpoints_emptyPolicyId) {
+    UA_Server *pServer = UA_Server_new();
+    UA_ServerConfig *config = UA_Server_getConfig(pServer);
+    ck_assert_uint_gt(config->accessControl.userTokenPoliciesSize, 0);
+
+    UA_UserTokenPolicy *policy = &config->accessControl.userTokenPolicies[0];
+    UA_String_clear(&policy->policyId);
+    policy->policyId = UA_STRING_ALLOC("");
+    ck_assert_ptr_eq(policy->policyId.data,
+                     (UA_Byte*)UA_EMPTY_ARRAY_SENTINEL);
+
+    UA_EndpointDescription *endpoints = NULL;
+    size_t endpointsSize = 0;
+    UA_StatusCode res =
+        setCurrentEndpointsArray(pServer, UA_STRING("opc.tcp://localhost:4840"),
+                                 NULL, 0, &endpoints, &endpointsSize);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+    ck_assert_uint_gt(endpointsSize, 0);
+    ck_assert_uint_gt(endpoints[0].userIdentityTokensSize, 0);
+    ck_assert_uint_gt(endpoints[0].userIdentityTokens[0].policyId.length, 0);
+
+    UA_Array_delete(endpoints, endpointsSize,
+                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    UA_Server_delete(pServer);
+}
+END_TEST
+
+START_TEST(Server_addEndpoint_rejectsInvalidSecurityMode) {
+    static const UA_Int32 modes[] = {0, -1, 4, UA_INT32_MAX};
+    UA_Server *pServer = UA_Server_new();
+    UA_ServerConfig *config = UA_Server_getConfig(pServer);
+    size_t endpointsSize = config->endpointsSize;
+
+    UA_StatusCode res =
+        UA_ServerConfig_addEndpoint(config, UA_SECURITY_POLICY_NONE_URI,
+                                    (UA_MessageSecurityMode)modes[_i]);
+    ck_assert_uint_eq(res, UA_STATUSCODE_BADSECURITYMODEREJECTED);
+    ck_assert_uint_eq(config->endpointsSize, endpointsSize);
+    UA_Server_delete(pServer);
+} END_TEST
+
+START_TEST(Server_getEndpoints_rejectsOutOfRangeSecurityMode) {
+    static const UA_Int32 modes[] = {-1, 4, UA_INT32_MAX};
+    UA_Server *pServer = UA_Server_new();
+    UA_ServerConfig *config = UA_Server_getConfig(pServer);
+    ck_assert_uint_gt(config->endpointsSize, 0);
+    config->endpoints[0].securityMode = (UA_MessageSecurityMode)modes[_i];
+
+    UA_EndpointDescription *endpoints = NULL;
+    size_t endpointsSize = 0;
+    UA_StatusCode res =
+        setCurrentEndpointsArray(pServer, UA_STRING("opc.tcp://localhost:4840"),
+                                 NULL, 0, &endpoints, &endpointsSize);
+    ck_assert_uint_eq(res, UA_STATUSCODE_BADSECURITYMODEREJECTED);
+
+    UA_Array_delete(endpoints, endpointsSize,
+                    &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    UA_Server_delete(pServer);
+} END_TEST
+
 START_TEST(Server_registerUnregister) {
     registerServer();
     registerServer(); // register twice just for fun
@@ -654,6 +757,26 @@ START_TEST(Server_registerTimeout) {
 
     while(!Client_find_discovery()) {}
 #endif
+}
+END_TEST
+
+START_TEST(Server_findServers_mirrors_endpointUrl) {
+    while(!Client_find_discovery()) {}
+
+    registerServer();
+
+    while(!Client_find_registered()) {}
+
+    /* Wait until FindServers returns exactly the two servers, each mirroring the
+     * requested discovery URL. Busy-wait (like the checks above) instead of a
+     * one-shot assert: under slow execution (valgrind) the registered entry can
+     * briefly age out between periodic re-registrations, so retry until the
+     * expected state is observed. */
+    while(!FindAndCheckDiscoveryUrls("opc.tcp://localhost:4840", 2)) {}
+
+    unregisterServer();
+
+    while(!Client_find_discovery()) {}
 }
 END_TEST
 
@@ -690,12 +813,16 @@ static Suite* testSuite_Client(void) {
     TCase *tc_new_del = tcase_create("New Delete");
     tcase_add_test(tc_new_del, Server_new_delete);
     tcase_add_test(tc_new_del, Server_new_shutdown_delete);
+    tcase_add_test(tc_new_del, Server_getEndpoints_emptyPolicyId);
+    tcase_add_loop_test(tc_new_del, Server_addEndpoint_rejectsInvalidSecurityMode, 0, 4);
+    tcase_add_loop_test(tc_new_del, Server_getEndpoints_rejectsOutOfRangeSecurityMode, 0, 3);
     suite_add_tcase(s,tc_new_del);
 
     TCase *tc_register = tcase_create("RegisterServer");
     tcase_add_unchecked_fixture(tc_register, setup_lds, teardown_lds);
     tcase_add_unchecked_fixture(tc_register, setup_register, teardown_register);
     tcase_add_test(tc_register, Server_registerUnregister);
+    tcase_add_test(tc_register, Server_findServers_mirrors_endpointUrl);
     suite_add_tcase(s,tc_register);
 
 #ifdef UA_ENABLE_DISCOVERY_MULTICAST

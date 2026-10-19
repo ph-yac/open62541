@@ -10,7 +10,10 @@
 #include "server/ua_subscription.h"
 
 #include <check.h>
+#include <math.h>
 #include <stdlib.h>
+
+#include "ziptree.h"
 
 #include "test_helpers.h"
 #include "testing_clock.h"
@@ -19,6 +22,8 @@ static UA_Server *server = NULL;
 static UA_Session *session = NULL;
 static UA_UInt32 monitored = 0; /* Number of active MonitoredItems */
 static UA_Double defaultRequestedPublishingInterval = 100;  /* in ms */
+static UA_Subscription *deletingSubscription = NULL;
+static size_t monitoredItemsAfterDelete = 0;
 
 static void
 monitoredRegisterCallback(UA_Server *s,
@@ -27,8 +32,23 @@ monitoredRegisterCallback(UA_Server *s,
                           const UA_UInt32 attrId, const UA_Boolean removed) {
     if(!removed)
         monitored++;
-    else
+    else {
         monitored--;
+        if(deletingSubscription) {
+            ck_assert_ptr_eq(ZIP_ROOT(&deletingSubscription->monitoredItemsById),
+                             NULL);
+            ck_assert_uint_eq(deletingSubscription->monitoredItemsSize, 0);
+            ck_assert_uint_eq(s->monitoredItemsSize, monitoredItemsAfterDelete);
+
+            /* Public server APIs can be called from registration callbacks. */
+            UA_QualifiedName browseName;
+            UA_QualifiedName_init(&browseName);
+            UA_StatusCode res = UA_Server_readBrowseName(
+                s, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER), &browseName);
+            ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+            UA_QualifiedName_clear(&browseName);
+        }
+    }
 }
 
 static void
@@ -71,6 +91,8 @@ createAuthenticatedSession(const char *userId) {
 }
 
 static void setup(void) {
+    deletingSubscription = NULL;
+    monitoredItemsAfterDelete = 0;
     server = UA_Server_newForUnitTest();
     ck_assert(server != NULL);
     UA_ServerConfig *config = UA_Server_getConfig(server);
@@ -94,6 +116,15 @@ static UA_ApplicationNotificationType subscriptionNotificationType;
 static UA_UInt32 subscriptionNotificationId = 0;
 static UA_Boolean subscriptionNotificationEnabled = false;
 static size_t subscriptionNotificationMapSize = 0;
+static UA_Boolean closeSessionAtMonitoredItemCreated;
+static UA_StatusCode closeSessionAtMonitoredItemCreatedResult;
+
+typedef struct {
+    UA_Callback callback;
+    void *application;
+    void *context;
+    size_t count;
+} ObservedCleanup;
 
 static const UA_Variant *
 findNotificationValue(const UA_KeyValueMap *map, const char *key) {
@@ -109,6 +140,29 @@ findNotificationValue(const UA_KeyValueMap *map, const char *key) {
     }
 
     return NULL;
+}
+
+static void
+closeSessionFromMonitoredItemCreated(UA_Server *s,
+                                    UA_ApplicationNotificationType type,
+                                    UA_KeyValueMap data) {
+    if(type != UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_CREATED ||
+       !closeSessionAtMonitoredItemCreated)
+        return;
+
+    closeSessionAtMonitoredItemCreated = false;
+    const UA_Variant *sessionId = findNotificationValue(&data, "session-id");
+    ck_assert_ptr_ne(sessionId, NULL);
+    ck_assert_ptr_ne(sessionId->data, NULL);
+    closeSessionAtMonitoredItemCreatedResult =
+        UA_Server_closeSession(s, (const UA_NodeId*)sessionId->data);
+}
+
+static void
+observeCleanup(void *application, void *context) {
+    ObservedCleanup *observed = (ObservedCleanup*)application;
+    observed->count++;
+    observed->callback(observed->application, observed->context);
 }
 
 static void
@@ -317,6 +371,39 @@ START_TEST(Server_deleteSubscription) {
     ck_assert_uint_eq(del_response.results[0], UA_STATUSCODE_GOOD);
 
     UA_DeleteSubscriptionsResponse_clear(&del_response);
+}
+END_TEST
+
+START_TEST(Server_deleteSubscription_callbackSeesConsistentIndex) {
+    createSubscription();
+    createMonitoredItem();
+    createMonitoredItem();
+    createMonitoredItem();
+
+    lockServer(server);
+    deletingSubscription =
+        UA_Session_getSubscriptionById(session, subscriptionId);
+    ck_assert_ptr_ne(deletingSubscription, NULL);
+    ck_assert_uint_eq(deletingSubscription->monitoredItemsSize, 3);
+    ck_assert_uint_ge(server->monitoredItemsSize, 3);
+    monitoredItemsAfterDelete =
+        server->monitoredItemsSize - deletingSubscription->monitoredItemsSize;
+
+    UA_DeleteSubscriptionsRequest request;
+    UA_DeleteSubscriptionsRequest_init(&request);
+    request.subscriptionIdsSize = 1;
+    request.subscriptionIds = &subscriptionId;
+
+    UA_DeleteSubscriptionsResponse response;
+    UA_DeleteSubscriptionsResponse_init(&response);
+    Service_DeleteSubscriptions(server, session, &request, &response);
+    deletingSubscription = NULL;
+    unlockServer(server);
+
+    ck_assert_uint_eq(response.resultsSize, 1);
+    ck_assert_uint_eq(response.results[0], UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(monitored, 0);
+    UA_DeleteSubscriptionsResponse_clear(&response);
 }
 END_TEST
 
@@ -934,6 +1021,60 @@ START_TEST(Server_negativeSamplingInterval) {
 }
 END_TEST
 
+START_TEST(Server_nanModifiedSamplingInterval) {
+    createSubscription();
+
+    UA_CreateMonitoredItemsRequest createRequest;
+    UA_CreateMonitoredItemsRequest_init(&createRequest);
+    createRequest.subscriptionId = subscriptionId;
+    createRequest.timestampsToReturn = UA_TIMESTAMPSTORETURN_SERVER;
+
+    UA_MonitoredItemCreateRequest createItem;
+    UA_MonitoredItemCreateRequest_init(&createItem);
+    createItem.itemToMonitor.nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER);
+    createItem.itemToMonitor.attributeId = UA_ATTRIBUTEID_BROWSENAME;
+    createItem.monitoringMode = UA_MONITORINGMODE_REPORTING;
+    createItem.requestedParameters.samplingInterval = 100.0;
+    createRequest.itemsToCreateSize = 1;
+    createRequest.itemsToCreate = &createItem;
+
+    UA_CreateMonitoredItemsResponse createResponse;
+    UA_CreateMonitoredItemsResponse_init(&createResponse);
+    lockServer(server);
+    Service_CreateMonitoredItems(server, session, &createRequest, &createResponse);
+    unlockServer(server);
+    ck_assert_uint_eq(createResponse.resultsSize, 1);
+    ck_assert_uint_eq(createResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_UInt32 monitoredItemId = createResponse.results[0].monitoredItemId;
+    UA_CreateMonitoredItemsResponse_clear(&createResponse);
+
+    UA_MonitoredItemModifyRequest modifyItem;
+    UA_MonitoredItemModifyRequest_init(&modifyItem);
+    modifyItem.monitoredItemId = monitoredItemId;
+    modifyItem.requestedParameters.samplingInterval = NAN;
+    modifyItem.requestedParameters.queueSize = 1;
+
+    UA_ModifyMonitoredItemsRequest modifyRequest;
+    UA_ModifyMonitoredItemsRequest_init(&modifyRequest);
+    modifyRequest.subscriptionId = subscriptionId;
+    modifyRequest.timestampsToReturn = UA_TIMESTAMPSTORETURN_SERVER;
+    modifyRequest.itemsToModifySize = 1;
+    modifyRequest.itemsToModify = &modifyItem;
+
+    UA_ModifyMonitoredItemsResponse modifyResponse;
+    UA_ModifyMonitoredItemsResponse_init(&modifyResponse);
+    lockServer(server);
+    Service_ModifyMonitoredItems(server, session, &modifyRequest, &modifyResponse);
+    unlockServer(server);
+    ck_assert_uint_eq(modifyResponse.resultsSize, 1);
+    ck_assert_uint_eq(modifyResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    ck_assert(isfinite(modifyResponse.results[0].revisedSamplingInterval));
+    ck_assert(modifyResponse.results[0].revisedSamplingInterval ==
+              server->config.samplingIntervalLimits.min);
+    UA_ModifyMonitoredItemsResponse_clear(&modifyResponse);
+}
+END_TEST
+
 START_TEST(Server_transferSubscriptionDiagnostics) {
     /* Test that subscription diagnostics counter is correctly maintained
      * when subscriptions are transferred between sessions */
@@ -1027,6 +1168,92 @@ START_TEST(Server_transferSubscriptionDiagnostics) {
     createSession();
 }
 END_TEST
+
+#ifdef UA_ENABLE_DIAGNOSTICS
+static UA_StatusCode
+setBrowseName(UA_Server *server, UA_Session *adminSession,
+              UA_Node *node, void *data) {
+    UA_QualifiedName_clear(&node->head.browseName);
+    return UA_QualifiedName_copy((UA_QualifiedName*)data,
+                                 &node->head.browseName);
+}
+
+START_TEST(Server_diagnosticsRejectLongBrowseNames) {
+    lockServer(server);
+    UA_String_clear(&session->sessionName);
+    session->sessionName = UA_STRING_ALLOC("diagnostics");
+    createSessionObject(server, session);
+
+    UA_BrowsePath bp;
+    UA_BrowsePath_init(&bp);
+    bp.startingNode = session->sessionId;
+    UA_RelativePathElement rpe;
+    UA_RelativePathElement_init(&rpe);
+    rpe.targetName = UA_QUALIFIEDNAME(0, "SessionDiagnostics");
+    bp.relativePath.elements = &rpe;
+    bp.relativePath.elementsSize = 1;
+    UA_BrowsePathResult bpr = translateBrowsePathToNodeIds(server, &bp);
+    unlockServer(server);
+    ck_assert_uint_eq(bpr.statusCode, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(bpr.targetsSize, 1);
+
+    UA_NodeId sessionDiagnosticNode;
+    UA_NodeId_init(&sessionDiagnosticNode);
+    UA_StatusCode res = UA_NodeId_copy(&bpr.targets[0].targetId.nodeId,
+                                       &sessionDiagnosticNode);
+    UA_BrowsePathResult_clear(&bpr);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    createSubscription();
+
+    lockServer(server);
+    UA_Subscription *sub = getSubscriptionById(server, subscriptionId);
+    ck_assert_ptr_ne(sub, NULL);
+    UA_NodeId diagnosticNode;
+    UA_NodeId_init(&diagnosticNode);
+    res = UA_NodeId_copy(&sub->ns0Id, &diagnosticNode);
+    unlockServer(server);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    char longNameData[128];
+    memset(longNameData, 'A', sizeof(longNameData));
+    UA_QualifiedName longName;
+    UA_QualifiedName_init(&longName);
+    longName.name.length = sizeof(longNameData);
+    longName.name.data = (UA_Byte*)(uintptr_t)longNameData;
+    lockServer(server);
+    res = editNode(server, &server->adminSession, &diagnosticNode,
+                   UA_NODEATTRIBUTESMASK_BROWSENAME, UA_REFERENCETYPESET_NONE,
+                   UA_BROWSEDIRECTION_BOTH, setBrowseName, &longName);
+    res |= editNode(server, &server->adminSession, &sessionDiagnosticNode,
+                    UA_NODEATTRIBUTESMASK_BROWSENAME, UA_REFERENCETYPESET_NONE,
+                    UA_BROWSEDIRECTION_BOTH, setBrowseName, &longName);
+    unlockServer(server);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+
+    UA_Variant value;
+    UA_Variant_init(&value);
+    res = UA_Server_readValue(server, diagnosticNode, &value);
+    ck_assert_uint_eq(res, UA_STATUSCODE_BADNOTIMPLEMENTED);
+    UA_Variant_clear(&value);
+
+    UA_ReadValueId rvi;
+    UA_ReadValueId_init(&rvi);
+    rvi.nodeId = sessionDiagnosticNode;
+    rvi.attributeId = UA_ATTRIBUTEID_VALUE;
+    lockServer(server);
+    UA_DataValue dv = readWithSession(server, session, &rvi,
+                                      UA_TIMESTAMPSTORETURN_NEITHER);
+    unlockServer(server);
+    ck_assert(dv.hasStatus);
+    ck_assert_uint_eq(dv.status, UA_STATUSCODE_BADNOTIMPLEMENTED);
+    UA_DataValue_clear(&dv);
+
+    UA_NodeId_clear(&diagnosticNode);
+    UA_NodeId_clear(&sessionDiagnosticNode);
+}
+END_TEST
+#endif
 
 /* Test anonymous user subscription transfer restriction */
 START_TEST(Server_transferSubscription_anonymous) {
@@ -1394,7 +1621,6 @@ START_TEST(Server_transferSubscription_sendInitialValues) {
     unlockServer(server);
 } END_TEST
 
-
 START_TEST(Server_createSubscription_notificationCallback) {
     UA_ServerConfig *config = UA_Server_getConfig(server);
 
@@ -1427,6 +1653,868 @@ START_TEST(Server_createSubscription_notificationCallback) {
     UA_CreateSubscriptionResponse_clear(&response);
 } END_TEST
 
+START_TEST(Server_closeSessionFromMonitoredItemCreated) {
+    createSubscription();
+    UA_Subscription *closedSubscription = getSubscriptionById(server,
+                                                              subscriptionId);
+    ck_assert_ptr_ne(closedSubscription, NULL);
+    UA_Session *closedSession = session;
+
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    config->subscriptionNotificationCallback =
+        closeSessionFromMonitoredItemCreated;
+    closeSessionAtMonitoredItemCreated = true;
+    closeSessionAtMonitoredItemCreatedResult = UA_STATUSCODE_BADINTERNALERROR;
+
+    createMonitoredItem();
+    ck_assert_uint_eq(closeSessionAtMonitoredItemCreatedResult,
+                      UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(server->sessionCount, 0);
+    ck_assert_uint_eq(server->subscriptionsSize, 0);
+    ck_assert_uint_eq(server->monitoredItemsSize, 0);
+
+    /* Drain the MonitoredItem, Subscription and Session cleanup callbacks.
+     * The create path must not enqueue the MonitoredItem callback again and
+     * overwrite its link to the later cleanup nodes. */
+    ObservedCleanup subscriptionCleanup = {
+        closedSubscription->delayedFreePointers.callback,
+        closedSubscription->delayedFreePointers.application,
+        closedSubscription->delayedFreePointers.context, 0
+    };
+    ck_assert(subscriptionCleanup.callback != NULL);
+    closedSubscription->delayedFreePointers.callback = observeCleanup;
+    closedSubscription->delayedFreePointers.application = &subscriptionCleanup;
+
+    session_list_entry *closedSessionEntry =
+        container_of(closedSession, session_list_entry, session);
+    ObservedCleanup sessionCleanup = {
+        closedSessionEntry->cleanupCallback.callback,
+        closedSessionEntry->cleanupCallback.application,
+        closedSessionEntry->cleanupCallback.context, 0
+    };
+    ck_assert(sessionCleanup.callback != NULL);
+    closedSessionEntry->cleanupCallback.callback = observeCleanup;
+    closedSessionEntry->cleanupCallback.application = &sessionCleanup;
+
+    UA_Server_run_iterate(server, false);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(subscriptionCleanup.count, 1);
+    ck_assert_uint_eq(sessionCleanup.count, 1);
+
+    config->subscriptionNotificationCallback = NULL;
+    session = NULL;
+} END_TEST
+
+/* Override hook: allow transfer of a detached subscription only when the new
+ * session authenticates as the expected user. */
+static const char *recoverOverrideExpectedUser = NULL;
+static UA_Boolean
+allowTransferSubscription_recoverOverride(UA_Server *server, UA_AccessControl *ac,
+                                         const UA_NodeId *oldSessionId,
+                                         void *oldSessionContext,
+                                         const UA_NodeId *newSessionId,
+                                         void *newSessionContext) {
+    /* Detached subscription: oldSessionId is null/zero after session timeout. */
+    if(oldSessionId && oldSessionId->identifierType != UA_NODEIDTYPE_NUMERIC)
+        return false;
+
+    UA_Variant newUserId;
+    UA_Variant_init(&newUserId);
+    UA_Server_getSessionAttribute(server, newSessionId,
+                                  UA_QUALIFIEDNAME(0, "clientUserId"),
+                                  &newUserId);
+    UA_Boolean result = false;
+    if(newUserId.type == &UA_TYPES[UA_TYPES_STRING] &&
+       recoverOverrideExpectedUser != NULL) {
+        UA_String *uid = (UA_String*)newUserId.data;
+        UA_String expected = UA_STRING((char*)(uintptr_t)recoverOverrideExpectedUser);
+        if(UA_String_equal(uid, &expected))
+            result = true;
+    }
+    UA_Variant_clear(&newUserId);
+    return result;
+}
+
+START_TEST(Server_subscriptionSurvivesSessionTimeoutButIsNotTransferable) {
+    /* Authenticated user to allow transfer */
+    lockServer(server);
+    UA_String_clear(&session->clientUserIdOfSession);
+    session->clientUserIdOfSession = UA_STRING_ALLOC("testuser");
+    unlockServer(server);
+
+    createSubscription();
+    createMonitoredItem();
+
+    /* Subscription exists */
+    lockServer(server);
+    UA_Subscription *sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+
+    /* Force session timeout */
+    lockServer(server);
+    session->validTill = UA_DateTime_nowMonotonic() - UA_DATETIME_SEC;
+    cleanupSessions(server, UA_DateTime_nowMonotonic());
+    unlockServer(server);
+    session = NULL;
+
+    /* Subscription survives in server-wide list, detached */
+    lockServer(server);
+    sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+    ck_assert_ptr_eq(sub->session, NULL);
+
+    /* Default policy denies transfer of a detached subscription even when the
+     * new session authenticates as the same user. */
+    UA_Session *session2 = createAuthenticatedSession("testuser");
+
+    UA_TransferSubscriptionsRequest transferRequest;
+    UA_TransferSubscriptionsRequest_init(&transferRequest);
+    transferRequest.subscriptionIdsSize = 1;
+    transferRequest.subscriptionIds = &subscriptionId;
+    transferRequest.sendInitialValues = false;
+
+    UA_TransferSubscriptionsResponse transferResponse;
+    UA_TransferSubscriptionsResponse_init(&transferResponse);
+
+    lockServer(server);
+    Service_TransferSubscriptions(server, session2, &transferRequest, &transferResponse);
+    unlockServer(server);
+
+    ck_assert_uint_eq(transferResponse.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(transferResponse.resultsSize, 1);
+    ck_assert_uint_eq(transferResponse.results[0].statusCode,
+                      UA_STATUSCODE_BADUSERACCESSDENIED);
+    UA_TransferSubscriptionsResponse_clear(&transferResponse);
+
+    /* Subscription still detached; teardown() reaps it. */
+    lockServer(server);
+    sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+    ck_assert_ptr_eq(sub->session, NULL);
+
+    lockServer(server);
+    UA_Server_closeSession(server, &session2->sessionId);
+    unlockServer(server);
+
+    createSession();
+}END_TEST
+
+/* Companion to the previous test: a custom allowTransferSubscription hook
+ * re-enables transfer of a detached subscription for the same user. Documents
+ * that the default policy can be overridden for this scenario. */
+START_TEST(Server_subscriptionRecoverableWithOverride) {
+    /* Install override; restore the previous hook at the end. */
+    UA_AccessControl *ac = &server->config.accessControl;
+    UA_Boolean (*prevHook)(UA_Server *, UA_AccessControl *,
+                           const UA_NodeId *, void *,
+                           const UA_NodeId *, void *) = ac->allowTransferSubscription;
+    ac->allowTransferSubscription = allowTransferSubscription_recoverOverride;
+    recoverOverrideExpectedUser = "testuser";
+
+    lockServer(server);
+    UA_String_clear(&session->clientUserIdOfSession);
+    session->clientUserIdOfSession = UA_STRING_ALLOC("testuser");
+    unlockServer(server);
+
+    createSubscription();
+    createMonitoredItem();
+
+    lockServer(server);
+    UA_Subscription *sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+
+    /* Force session timeout */
+    lockServer(server);
+    session->validTill = UA_DateTime_nowMonotonic() - UA_DATETIME_SEC;
+    cleanupSessions(server, UA_DateTime_nowMonotonic());
+    unlockServer(server);
+    session = NULL;
+
+    /* Subscription detached */
+    lockServer(server);
+    sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+    ck_assert_ptr_eq(sub->session, NULL);
+
+    /* Override allows the same-user session to reclaim the detached subscription. */
+    UA_Session *session2 = createAuthenticatedSession("testuser");
+
+    UA_TransferSubscriptionsRequest transferRequest;
+    UA_TransferSubscriptionsRequest_init(&transferRequest);
+    transferRequest.subscriptionIdsSize = 1;
+    transferRequest.subscriptionIds = &subscriptionId;
+    transferRequest.sendInitialValues = false;
+
+    UA_TransferSubscriptionsResponse transferResponse;
+    UA_TransferSubscriptionsResponse_init(&transferResponse);
+
+    lockServer(server);
+    Service_TransferSubscriptions(server, session2, &transferRequest, &transferResponse);
+    unlockServer(server);
+
+    ck_assert_uint_eq(transferResponse.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(transferResponse.resultsSize, 1);
+    ck_assert_uint_eq(transferResponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_TransferSubscriptionsResponse_clear(&transferResponse);
+
+    /* Re-attached to the new session */
+    lockServer(server);
+    sub = getSubscriptionById(server, subscriptionId);
+    unlockServer(server);
+    ck_assert_ptr_ne(sub, NULL);
+    ck_assert_ptr_eq(sub->session, session2);
+
+    /* Restore hook before cleanup so other tests see the default policy. */
+    ac->allowTransferSubscription = prevHook;
+    recoverOverrideExpectedUser = NULL;
+
+    /* Cleanup */
+    UA_DeleteSubscriptionsRequest delRequest;
+    UA_DeleteSubscriptionsRequest_init(&delRequest);
+    delRequest.subscriptionIdsSize = 1;
+    delRequest.subscriptionIds = &subscriptionId;
+
+    UA_DeleteSubscriptionsResponse delResponse;
+    UA_DeleteSubscriptionsResponse_init(&delResponse);
+
+    lockServer(server);
+    Service_DeleteSubscriptions(server, session2, &delRequest, &delResponse);
+    unlockServer(server);
+    ck_assert_uint_eq(delResponse.resultsSize, 1);
+    ck_assert_uint_eq(delResponse.results[0], UA_STATUSCODE_GOOD);
+    UA_DeleteSubscriptionsResponse_clear(&delResponse);
+
+    lockServer(server);
+    UA_Server_closeSession(server, &session2->sessionId);
+    unlockServer(server);
+
+    createSession();
+}END_TEST
+
+/* DataSource nodes with SamplingInterval=0 must use PUBLISH (periodic) sampling,
+ * not EVENT (backpointer) sampling, because they are never written via the Write
+ * service; tested with Server/ServerStatus/CurrentTime (i=2258). */
+START_TEST(Server_dataSourceSamplingIntervalZero) {
+    /* Create a subscription */
+    UA_CreateSubscriptionRequest subRequest;
+    UA_CreateSubscriptionRequest_init(&subRequest);
+    subRequest.publishingEnabled = UA_TRUE;
+    subRequest.requestedPublishingInterval = defaultRequestedPublishingInterval;
+
+    UA_CreateSubscriptionResponse subResponse;
+    UA_CreateSubscriptionResponse_init(&subResponse);
+
+    lockServer(server);
+    Service_CreateSubscription(server, session, &subRequest, &subResponse);
+    unlockServer(server);
+    ck_assert_uint_eq(subResponse.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    UA_UInt32 localSubId = subResponse.subscriptionId;
+    UA_Double publishingInterval = subResponse.revisedPublishingInterval;
+    UA_CreateSubscriptionResponse_clear(&subResponse);
+
+    /* Create a MonitoredItem on Server/ServerStatus/CurrentTime (i=2258)
+     * with SamplingInterval=0 */
+    UA_CreateMonitoredItemsRequest mrequest;
+    UA_CreateMonitoredItemsRequest_init(&mrequest);
+    mrequest.subscriptionId = localSubId;
+    mrequest.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+
+    UA_MonitoredItemCreateRequest item;
+    UA_MonitoredItemCreateRequest_init(&item);
+    UA_ReadValueId rvi;
+    UA_ReadValueId_init(&rvi);
+    rvi.nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+    rvi.attributeId = UA_ATTRIBUTEID_VALUE;
+    item.itemToMonitor = rvi;
+    item.monitoringMode = UA_MONITORINGMODE_REPORTING;
+    UA_MonitoringParameters params;
+    UA_MonitoringParameters_init(&params);
+    params.samplingInterval = 0.0; /* key: SamplingInterval=0 on a DataSource node */
+    params.queueSize = 10;
+    params.discardOldest = UA_TRUE;
+    item.requestedParameters = params;
+    mrequest.itemsToCreateSize = 1;
+    mrequest.itemsToCreate = &item;
+
+    UA_CreateMonitoredItemsResponse mresponse;
+    UA_CreateMonitoredItemsResponse_init(&mresponse);
+
+    lockServer(server);
+    Service_CreateMonitoredItems(server, session, &mrequest, &mresponse);
+    unlockServer(server);
+    ck_assert_uint_eq(mresponse.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(mresponse.resultsSize, 1);
+    ck_assert_uint_eq(mresponse.results[0].statusCode, UA_STATUSCODE_GOOD);
+    UA_UInt32 localMonId = mresponse.results[0].monitoredItemId;
+    ck_assert_uint_gt(localMonId, 0);
+    /* The server may revise the sampling interval (e.g. to the publishing
+     * interval). Accept any non-negative value; the important structural
+     * assertion is that the item uses PUBLISH sampling, not EVENT sampling. */
+    ck_assert(mresponse.results[0].revisedSamplingInterval >= 0.0);
+
+    UA_MonitoredItemCreateRequest_clear(&item);
+    UA_CreateMonitoredItemsResponse_clear(&mresponse);
+
+    /* Locate the MonitoredItem and verify it is registered with PUBLISH sampling,
+     * not EVENT (backpointer) sampling. This is the structural assertion for the
+     * fix: a DataSource node with SamplingInterval=0 must land in
+     * sub->samplingMonitoredItems, not in the node's monitoredItems backpointer
+     * list. */
+    UA_Subscription *sub = NULL;
+    TAILQ_FOREACH(sub, &session->subscriptions, sessionListEntry) {
+        if(sub->subscriptionId == localSubId)
+            break;
+    }
+    ck_assert_ptr_ne(sub, NULL);
+
+    UA_MonitoredItem *mon = NULL;
+    UA_MonitoredItem *tmpMon;
+    LIST_FOREACH(tmpMon, &sub->samplingMonitoredItems, sampling.subscriptionSampling) {
+        if(tmpMon->monitoredItemId == localMonId) {
+            mon = tmpMon;
+            break;
+        }
+    }
+    ck_assert_ptr_ne(mon, NULL);
+    ck_assert_uint_eq(mon->samplingType, UA_MONITOREDITEMSAMPLINGTYPE_PUBLISH);
+
+    /* First publish cycle: capture the initial CurrentTime value */
+    UA_fakeSleep((UA_UInt32)publishingInterval + 1);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_ge(mon->queueSize, 1);
+
+    UA_Notification *notification = TAILQ_LAST(&mon->queue, NotificationQueue);
+    ck_assert_ptr_ne(notification, NULL);
+    ck_assert(notification->data.dataChange.value.hasValue);
+    ck_assert(notification->data.dataChange.value.value.type == &UA_TYPES[UA_TYPES_DATETIME]);
+    UA_DateTime t1 = *(UA_DateTime*)notification->data.dataChange.value.value.data;
+    UA_UInt32 queueBefore = mon->queueSize;
+
+    /* Advance the test clock and trigger a second publish cycle.
+     * readCurrentTime() returns UA_DateTime_now(), which is controlled by
+     * UA_fakeSleep, so the value in the second cycle will differ from t1 and
+     * a new DataChangeNotification must be enqueued. */
+    UA_fakeSleep((UA_UInt32)publishingInterval + 1);
+    UA_Server_run_iterate(server, false);
+
+    ck_assert_uint_gt(mon->queueSize, queueBefore);
+    notification = TAILQ_LAST(&mon->queue, NotificationQueue);
+    ck_assert_ptr_ne(notification, NULL);
+    ck_assert(notification->data.dataChange.value.hasValue);
+    UA_DateTime t2 = *(UA_DateTime*)notification->data.dataChange.value.value.data;
+    ck_assert(t2 > t1);
+
+    /* Cleanup */
+    UA_DeleteSubscriptionsRequest delRequest;
+    UA_DeleteSubscriptionsRequest_init(&delRequest);
+    delRequest.subscriptionIdsSize = 1;
+    delRequest.subscriptionIds = &localSubId;
+
+    UA_DeleteSubscriptionsResponse delResponse;
+    UA_DeleteSubscriptionsResponse_init(&delResponse);
+
+    lockServer(server);
+    Service_DeleteSubscriptions(server, session, &delRequest, &delResponse);
+    unlockServer(server);
+    ck_assert_uint_eq(delResponse.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    UA_DeleteSubscriptionsResponse_clear(&delResponse);
+}
+END_TEST
+
+/* ==== Subscription / MonitoredItem limit guards (white-box) ==== */
+
+START_TEST(Server_republish_unknownSequenceNumber) {
+    /* src/server/ua_services_subscription.c:491-494:
+     *   if(!entry) {
+     *     response->responseHeader.serviceResult = UA_STATUSCODE_BADMESSAGENOTAVAILABLE;
+     *     return true;
+     *   }
+     * The existing Server_republish_invalid uses subscriptionId = 0
+     * (BADSUBSCRIPTIONIDINVALID branch at 472-475). The
+     * BADMESSAGENOTAVAILABLE branch needs a valid subscriptionId +
+     * a sequence number that is not in the retransmission queue. */
+    createSubscription();
+
+    UA_RepublishRequest request;
+    UA_RepublishRequest_init(&request);
+    request.subscriptionId = subscriptionId;
+    request.retransmitSequenceNumber = 99999; /* not in queue */
+
+    UA_RepublishResponse response;
+    UA_RepublishResponse_init(&response);
+
+    lockServer(server);
+    Service_Republish(server, session, &request, &response);
+    unlockServer(server);
+
+    ck_assert_uint_eq(response.responseHeader.serviceResult,
+                      UA_STATUSCODE_BADMESSAGENOTAVAILABLE);
+    UA_RepublishResponse_clear(&response);
+} END_TEST
+
+START_TEST(Server_createSubscription_maxSubscriptionsPerSession) {
+    /* src/server/ua_services_subscription.c:109-115:
+     *   if(maxSubscriptionsPerSession != 0 &&
+     *      session->subscriptionsSize >= maxSubscriptionsPerSession) {
+     *     response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYSUBSCRIPTIONS;
+     *     return true;
+     *   } */
+    createSubscription(); /* first subscription */
+
+    UA_ServerConfig *cfg = UA_Server_getConfig(server);
+    UA_UInt32 orig = cfg->maxSubscriptionsPerSession;
+    cfg->maxSubscriptionsPerSession = 1; /* already at the limit */
+
+    UA_CreateSubscriptionRequest req;
+    UA_CreateSubscriptionRequest_init(&req);
+    req.requestedPublishingInterval = 500.0;
+    req.requestedLifetimeCount = 100;
+    req.requestedMaxKeepAliveCount = 10;
+
+    UA_CreateSubscriptionResponse resp;
+    UA_CreateSubscriptionResponse_init(&resp);
+
+    lockServer(server);
+    UA_Boolean ok = Service_CreateSubscription(server, session, &req, &resp);
+    unlockServer(server);
+
+    ck_assert(ok);
+    ck_assert_uint_eq(resp.responseHeader.serviceResult,
+                      UA_STATUSCODE_BADTOOMANYSUBSCRIPTIONS);
+    ck_assert_uint_eq(resp.subscriptionId, 0);
+
+    cfg->maxSubscriptionsPerSession = orig;
+    UA_CreateSubscriptionResponse_clear(&resp);
+} END_TEST
+
+START_TEST(Server_createMonitoredItems_maxPerSubscription) {
+    /* src/server/ua_services_monitoreditem.c:444-452 (Operation_CreateMonitoredItem):
+     *   if(!cmc->localMon &&
+     *      (...maxMonitoredItemsPerSubscription exceeded...)) {
+     *     result->statusCode = UA_STATUSCODE_BADTOOMANYMONITOREDITEMS;
+     *   }
+     * The "per subscription" branch is the more commonly-triggered
+     * one (per-server limit is rarely hit). */
+    createSubscription();
+    createMonitoredItem();
+
+    UA_ServerConfig *cfg = UA_Server_getConfig(server);
+    UA_UInt32 orig = cfg->maxMonitoredItemsPerSubscription;
+    cfg->maxMonitoredItemsPerSubscription = 1; /* already at the limit */
+
+    UA_CreateMonitoredItemsRequest req;
+    UA_CreateMonitoredItemsRequest_init(&req);
+    req.subscriptionId = subscriptionId;
+    req.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+    req.itemsToCreateSize = 1;
+    req.itemsToCreate = (UA_MonitoredItemCreateRequest*)
+        UA_Array_new(1, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+    UA_MonitoredItemCreateRequest_init(&req.itemsToCreate[0]);
+    req.itemsToCreate[0].itemToMonitor.nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+
+    UA_CreateMonitoredItemsResponse resp;
+    UA_CreateMonitoredItemsResponse_init(&resp);
+
+    lockServer(server);
+    Service_CreateMonitoredItems(server, session, &req, &resp);
+    unlockServer(server);
+
+    ck_assert_uint_eq(resp.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(resp.resultsSize, 1);
+    ck_assert_uint_eq(resp.results[0].statusCode,
+                      UA_STATUSCODE_BADTOOMANYMONITOREDITEMS);
+
+    cfg->maxMonitoredItemsPerSubscription = orig;
+    UA_Array_delete(req.itemsToCreate, 1, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+    UA_CreateMonitoredItemsResponse_clear(&resp);
+} END_TEST
+
+START_TEST(Server_createMonitoredItems_maxMonitoredItemsPerCall) {
+    /* src/server/ua_services_monitoreditem.c:606-610 (Service_CreateMonitoredItems):
+     *   if(maxMonitoredItemsPerCall != 0 &&
+     *      request->itemsToCreateSize > maxMonitoredItemsPerCall) {
+     *     response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYOPERATIONS;
+     *     return true;
+     *   } */
+    createSubscription();
+
+    UA_ServerConfig *cfg = UA_Server_getConfig(server);
+    UA_UInt32 orig = cfg->maxMonitoredItemsPerCall;
+    cfg->maxMonitoredItemsPerCall = 1;
+
+    UA_CreateMonitoredItemsRequest req;
+    UA_CreateMonitoredItemsRequest_init(&req);
+    req.subscriptionId = subscriptionId;
+    req.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+    req.itemsToCreateSize = 2; /* exceeds 1 */
+    req.itemsToCreate = (UA_MonitoredItemCreateRequest*)
+        UA_Array_new(2, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+    for(size_t i = 0; i < 2; i++) {
+        UA_MonitoredItemCreateRequest_init(&req.itemsToCreate[i]);
+        req.itemsToCreate[i].itemToMonitor.nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_CURRENTTIME);
+    }
+
+    UA_CreateMonitoredItemsResponse resp;
+    UA_CreateMonitoredItemsResponse_init(&resp);
+
+    lockServer(server);
+    Service_CreateMonitoredItems(server, session, &req, &resp);
+    unlockServer(server);
+
+    ck_assert_uint_eq(resp.responseHeader.serviceResult,
+                      UA_STATUSCODE_BADTOOMANYOPERATIONS);
+    ck_assert_uint_eq(resp.resultsSize, 0);
+
+    cfg->maxMonitoredItemsPerCall = orig;
+    UA_Array_delete(req.itemsToCreate, 2, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+    UA_CreateMonitoredItemsResponse_clear(&resp);
+} END_TEST
+
+/* ==== Service_ModifyMonitoredItems / Service_SetMonitoringMode guards ==== */
+
+START_TEST(Server_ModifyMonitoredItems_invalidTimestampsToReturn) {
+    /* src/server/ua_services_monitoreditem.c:889-893:
+     *   if(request->timestampsToReturn > UA_TIMESTAMPSTORETURN_NEITHER) {
+     *     response->responseHeader.serviceResult = UA_STATUSCODE_BADTIMESTAMPSTORETURNINVALID;
+     *     return true;
+     *   }
+     * The existing Server_modifyMonitoredItems test only uses the
+     * happy path with valid timestampsToReturn. */
+    createSubscription();
+    createMonitoredItem();
+
+    UA_ModifyMonitoredItemsRequest req;
+    UA_ModifyMonitoredItemsRequest_init(&req);
+    req.subscriptionId = subscriptionId;
+    req.timestampsToReturn = (UA_TimestampsToReturn)99; /* out of range */
+    req.itemsToModifySize = 1;
+    req.itemsToModify = (UA_MonitoredItemModifyRequest*)
+        UA_Array_new(1, &UA_TYPES[UA_TYPES_MONITOREDITEMMODIFYREQUEST]);
+    UA_MonitoredItemModifyRequest_init(&req.itemsToModify[0]);
+    req.itemsToModify[0].monitoredItemId = monitoredItemId;
+
+    UA_ModifyMonitoredItemsResponse resp;
+    UA_ModifyMonitoredItemsResponse_init(&resp);
+
+    lockServer(server);
+    Service_ModifyMonitoredItems(server, session, &req, &resp);
+    unlockServer(server);
+
+    ck_assert_uint_eq(resp.responseHeader.serviceResult,
+                      UA_STATUSCODE_BADTIMESTAMPSTORETURNINVALID);
+    ck_assert_uint_eq(resp.resultsSize, 0);
+
+    UA_Array_delete(req.itemsToModify, 1, &UA_TYPES[UA_TYPES_MONITOREDITEMMODIFYREQUEST]);
+    UA_ModifyMonitoredItemsResponse_clear(&resp);
+} END_TEST
+
+START_TEST(Server_SetMonitoringMode_maxMonitoredItemsPerCall) {
+    /* src/server/ua_services_monitoreditem.c:943-948:
+     *   if(maxMonitoredItemsPerCall != 0 &&
+     *      request->monitoredItemIdsSize > maxMonitoredItemsPerCall) {
+     *     response->responseHeader.serviceResult = UA_STATUSCODE_BADTOOMANYOPERATIONS;
+     *   }
+     * The same guard exists in Service_CreateMonitoredItems (covered
+     * by Server_createMonitoredItems_maxMonitoredItemsPerCall) but
+     * the SetMonitoringMode path is a different code branch. */
+    createSubscription();
+    createMonitoredItem();
+
+    UA_ServerConfig *cfg = UA_Server_getConfig(server);
+    UA_UInt32 orig = cfg->maxMonitoredItemsPerCall;
+    cfg->maxMonitoredItemsPerCall = 1;
+
+    UA_SetMonitoringModeRequest req;
+    UA_SetMonitoringModeRequest_init(&req);
+    req.subscriptionId = subscriptionId;
+    req.monitoringMode = UA_MONITORINGMODE_REPORTING;
+    req.monitoredItemIdsSize = 2; /* exceeds 1 */
+    req.monitoredItemIds = (UA_UInt32*)
+        UA_Array_new(2, &UA_TYPES[UA_TYPES_UINT32]);
+    req.monitoredItemIds[0] = monitoredItemId;
+    req.monitoredItemIds[1] = monitoredItemId + 1; /* any value */
+
+    UA_SetMonitoringModeResponse resp;
+    UA_SetMonitoringModeResponse_init(&resp);
+
+    lockServer(server);
+    Service_SetMonitoringMode(server, session, &req, &resp);
+    unlockServer(server);
+
+    ck_assert_uint_eq(resp.responseHeader.serviceResult,
+                      UA_STATUSCODE_BADTOOMANYOPERATIONS);
+    ck_assert_uint_eq(resp.resultsSize, 0);
+
+    cfg->maxMonitoredItemsPerCall = orig;
+    UA_Array_delete(req.monitoredItemIds, 2, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_SetMonitoringModeResponse_clear(&resp);
+} END_TEST
+
+START_TEST(Server_transferSubscription_keepsMonitoredItemsTree) {
+    createSubscription();
+
+    UA_UInt32 ids[3];
+    createMonitoredItem();
+    ids[0] = monitoredItemId;
+    createMonitoredItem();
+    ids[1] = monitoredItemId;
+    createMonitoredItem();
+    ids[2] = monitoredItemId;
+
+    /* Also authenticate the first session */
+    lockServer(server);
+    UA_Subscription *oldSub =
+        UA_Session_getSubscriptionById(session, subscriptionId);
+    ck_assert_ptr_ne(oldSub, NULL);
+    ck_assert_uint_eq(oldSub->monitoredItemsSize, 3);
+    UA_String_clear(&session->clientUserIdOfSession);
+    session->clientUserIdOfSession = UA_STRING_ALLOC("user1");
+    unlockServer(server);
+
+    /* Create a second authenticated session */
+    UA_Session *session2 = createAuthenticatedSession("user1");
+
+    UA_TransferSubscriptionsRequest transferRequest;
+    UA_TransferSubscriptionsRequest_init(&transferRequest);
+    transferRequest.subscriptionIdsSize = 1;
+    transferRequest.subscriptionIds = &subscriptionId;
+    transferRequest.sendInitialValues = false;
+
+    UA_TransferSubscriptionsResponse transferResponse;
+    UA_TransferSubscriptionsResponse_init(&transferResponse);
+
+    lockServer(server);
+    Service_TransferSubscriptions(server, session2,
+                                  &transferRequest, &transferResponse);
+    ck_assert_uint_eq(transferResponse.responseHeader.serviceResult,
+                      UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(transferResponse.resultsSize, 1);
+    ck_assert_uint_eq(transferResponse.results[0].statusCode,
+                      UA_STATUSCODE_GOOD);
+
+    ck_assert_uint_eq(oldSub->monitoredItemsSize, 0);
+    ck_assert_ptr_eq(
+        ZIP_ROOT(&oldSub->monitoredItemsById), NULL);
+
+    UA_Subscription *newSub =
+        UA_Session_getSubscriptionById(session2, subscriptionId);
+    ck_assert_ptr_ne(newSub, NULL);
+    ck_assert_uint_eq(newSub->monitoredItemsSize, 3);
+    ck_assert_ptr_ne(
+        ZIP_ROOT(&newSub->monitoredItemsById),
+        NULL);
+
+    for(size_t i = 0; i < 3; i++) {
+        UA_MonitoredItem *mon =
+            ZIP_FIND(UA_MonitoredItemIdTree, &newSub->monitoredItemsById, &ids[i]);
+        ck_assert_ptr_ne(mon, NULL);
+        ck_assert_ptr_eq(mon->subscription, newSub);
+    }
+    unlockServer(server);
+
+    /* Verify that the transferred tree is fully functional by deleting one
+     * monitored item from the new subscription */
+    UA_DeleteMonitoredItemsRequest deleteRequest;
+    UA_DeleteMonitoredItemsRequest_init(&deleteRequest);
+    deleteRequest.subscriptionId = subscriptionId;
+    deleteRequest.monitoredItemIdsSize = 1;
+    deleteRequest.monitoredItemIds = &ids[0];
+
+    UA_DeleteMonitoredItemsResponse deleteResponse;
+    UA_DeleteMonitoredItemsResponse_init(&deleteResponse);
+
+    lockServer(server);
+    Service_DeleteMonitoredItems(server, session2, &deleteRequest, &deleteResponse);
+    unlockServer(server);
+
+    ck_assert_uint_eq(deleteResponse.responseHeader.serviceResult,
+                      UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(deleteResponse.resultsSize, 1);
+    ck_assert_uint_eq(deleteResponse.results[0], UA_STATUSCODE_GOOD);
+
+    lockServer(server);
+    ck_assert_uint_eq(newSub->monitoredItemsSize, 2);
+    ck_assert_ptr_eq(
+        ZIP_FIND(UA_MonitoredItemIdTree, &newSub->monitoredItemsById, &ids[0]),
+        NULL);
+    ck_assert_ptr_ne(
+        ZIP_FIND(UA_MonitoredItemIdTree, &newSub->monitoredItemsById, &ids[1]),
+        NULL);
+    ck_assert_ptr_ne(
+        ZIP_FIND(UA_MonitoredItemIdTree, &newSub->monitoredItemsById, &ids[2]),
+        NULL);
+    unlockServer(server);
+
+    UA_DeleteMonitoredItemsResponse_clear(&deleteResponse);
+
+    UA_TransferSubscriptionsResponse_clear(&transferResponse);
+
+    lockServer(server);
+    UA_Server_closeSession(server, &session2->sessionId);
+    unlockServer(server);
+} END_TEST
+
+START_TEST(Server_deleteMonitoredItems_partial_keepsTreeConsistent) {
+    createSubscription();
+
+    UA_UInt32 ids[3];
+    createMonitoredItem();
+    ids[0] = monitoredItemId;
+    createMonitoredItem();
+    ids[1] = monitoredItemId;
+    createMonitoredItem();
+    ids[2] = monitoredItemId;
+
+    lockServer(server);
+    UA_Subscription *sub =
+        UA_Session_getSubscriptionById(session, subscriptionId);
+    ck_assert_ptr_ne(sub, NULL);
+    ck_assert_uint_eq(sub->monitoredItemsSize, 3);
+    unlockServer(server);
+
+    UA_DeleteMonitoredItemsRequest request;
+    UA_DeleteMonitoredItemsRequest_init(&request);
+    request.subscriptionId = subscriptionId;
+    request.monitoredItemIdsSize = 1;
+    request.monitoredItemIds = &ids[1];
+
+    UA_DeleteMonitoredItemsResponse response;
+    UA_DeleteMonitoredItemsResponse_init(&response);
+
+    lockServer(server);
+    Service_DeleteMonitoredItems(server, session, &request, &response);
+    unlockServer(server);
+    ck_assert_uint_eq(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(response.resultsSize, 1);
+    ck_assert_uint_eq(response.results[0], UA_STATUSCODE_GOOD);
+
+    lockServer(server);
+    ck_assert_uint_eq(sub->monitoredItemsSize, 2);
+    ck_assert_ptr_eq(
+        ZIP_FIND(UA_MonitoredItemIdTree, &sub->monitoredItemsById, &ids[1]),
+        NULL);
+    ck_assert_ptr_ne(
+        ZIP_FIND(UA_MonitoredItemIdTree, &sub->monitoredItemsById, &ids[0]),
+        NULL);
+    ck_assert_ptr_ne(
+        ZIP_FIND(UA_MonitoredItemIdTree, &sub->monitoredItemsById, &ids[2]),
+        NULL);
+    unlockServer(server);
+
+    UA_UInt32 remainingIds[2];
+    remainingIds[0] = ids[0];
+    remainingIds[1] = ids[2];
+    request.monitoredItemIdsSize = 2;
+    request.monitoredItemIds = remainingIds;
+
+    UA_DeleteMonitoredItemsResponse_clear(&response);
+    UA_DeleteMonitoredItemsResponse_init(&response);
+
+    lockServer(server);
+    Service_DeleteMonitoredItems(server, session, &request, &response);
+    unlockServer(server);
+    ck_assert_uint_eq(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(response.resultsSize, 2);
+    ck_assert_uint_eq(response.results[0], UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(response.results[1], UA_STATUSCODE_GOOD);
+
+    UA_DeleteMonitoredItemsResponse_clear(&response);
+} END_TEST
+
+/* Coverage for the per-node MonitoredItem list (samplingInterval == 0 "on
+ * write" sampling). Exercises the O(1) unlink (head, interior and tail) and
+ * the on-write iterator, asserting the LIST back-pointer invariant
+ * (*le_prev == element) on every element throughout. */
+
+static void
+nodeBpSampleCallback(UA_Server *s, UA_UInt32 monId, void *monCtx,
+                     const UA_NodeId *nid, void *nodeCtx, UA_UInt32 attrId,
+                     const UA_DataValue *value) {
+    (void)s; (void)monId; (void)monCtx; (void)nid;
+    (void)nodeCtx; (void)attrId; (void)value;
+}
+
+/* Walk the node's MonitoredItem list, assert the LIST back-pointer invariant
+ * (*le_prev == element) for every element and return the length. The invariant
+ * also catches a stale le_prev after the copy-on-write of a Node. */
+static size_t
+nodeBackpointerCount(UA_NodeId nodeId) {
+    lockServer(server);
+    const UA_Node *n = UA_NODESTORE_GET(server, &nodeId);
+    ck_assert(n != NULL);
+    size_t cnt = 0;
+    for(UA_MonitoredItem *m = n->head.monitoredItems; m;
+        m = m->sampling.nodeListEntry.le_next) {
+        ck_assert_ptr_eq(*(m->sampling.nodeListEntry.le_prev), m);
+        cnt++;
+    }
+    UA_NODESTORE_RELEASE(server, n);
+    unlockServer(server);
+    return cnt;
+}
+
+START_TEST(Server_monitoredItems_sameNode_backpointer) {
+    /* A regular, writable variable node. */
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Int32 val = 1;
+    UA_Variant_setScalar(&attr.value, &val, &UA_TYPES[UA_TYPES_INT32]);
+    attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+    UA_NodeId nodeId = UA_NODEID_STRING(1, "node.backpointer");
+    ck_assert_uint_eq(UA_Server_addVariableNode(server, nodeId,
+        UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+        UA_QUALIFIEDNAME(1, "bp"), UA_NODEID_NULL, attr, NULL, NULL),
+        UA_STATUSCODE_GOOD);
+
+    /* Five local MonitoredItems with samplingInterval == 0 on the SAME node:
+     * they all land on the per-node "on write" list. */
+    const size_t K = 5;
+    UA_UInt32 ids[5];
+    UA_MonitoredItemCreateRequest item;
+    UA_MonitoredItemCreateRequest_init(&item);
+    item.itemToMonitor.nodeId = nodeId;
+    item.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
+    item.monitoringMode = UA_MONITORINGMODE_REPORTING;
+    item.requestedParameters.samplingInterval = 0.0;
+    for(size_t i = 0; i < K; i++) {
+        UA_MonitoredItemCreateResult r = UA_Server_createDataChangeMonitoredItem(
+            server, UA_TIMESTAMPSTORETURN_NEITHER, item, NULL, nodeBpSampleCallback);
+        ck_assert_uint_eq(r.statusCode, UA_STATUSCODE_GOOD);
+        ids[i] = r.monitoredItemId;
+    }
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), K);
+
+    /* Write the node: runs the on-write iterator over the whole list. The
+     * list and its back-pointers must survive intact. */
+    UA_Int32 nv = 2;
+    UA_Variant v;
+    UA_Variant_setScalar(&v, &nv, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert_uint_eq(UA_Server_writeValue(server, nodeId, v), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), K);
+
+    /* Remove an interior element, then the head-of-list and the tail-of-list
+     * elements: exercises every branch of the O(1) unlink. */
+    ck_assert_uint_eq(UA_Server_deleteMonitoredItem(server, ids[2]), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), K - 1);
+    ck_assert_uint_eq(UA_Server_deleteMonitoredItem(server, ids[4]), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), K - 2);
+    ck_assert_uint_eq(UA_Server_deleteMonitoredItem(server, ids[0]), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), K - 3);
+
+    /* Write again with the shortened list, then remove the remainder. */
+    nv = 3;
+    UA_Variant_setScalar(&v, &nv, &UA_TYPES[UA_TYPES_INT32]);
+    ck_assert_uint_eq(UA_Server_writeValue(server, nodeId, v), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_deleteMonitoredItem(server, ids[1]), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_deleteMonitoredItem(server, ids[3]), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nodeBackpointerCount(nodeId), 0);
+} END_TEST
+
 #endif /* UA_ENABLE_SUBSCRIPTIONS */
 
 static Suite* testSuite_Client(void) {
@@ -1436,9 +2524,17 @@ static Suite* testSuite_Client(void) {
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     tcase_add_test(tc_server, Server_createSubscription);
     tcase_add_test(tc_server, Server_createSubscription_notificationCallback);
+    tcase_add_test(tc_server, Server_closeSessionFromMonitoredItemCreated);
+    tcase_add_test(tc_server, Server_republish_unknownSequenceNumber);
+    tcase_add_test(tc_server, Server_createSubscription_maxSubscriptionsPerSession);
+    tcase_add_test(tc_server, Server_createMonitoredItems_maxPerSubscription);
+    tcase_add_test(tc_server, Server_createMonitoredItems_maxMonitoredItemsPerCall);
+    tcase_add_test(tc_server, Server_ModifyMonitoredItems_invalidTimestampsToReturn);
+    tcase_add_test(tc_server, Server_SetMonitoringMode_maxMonitoredItemsPerCall);
     tcase_add_test(tc_server, Server_modifySubscription);
     tcase_add_test(tc_server, Server_setPublishingMode);
     tcase_add_test(tc_server, Server_negativeSamplingInterval);
+    tcase_add_test(tc_server, Server_nanModifiedSamplingInterval);
     tcase_add_test(tc_server, Server_createMonitoredItems);
     tcase_add_test(tc_server, Server_modifyMonitoredItems);
     tcase_add_test(tc_server, Server_overflow);
@@ -1447,10 +2543,15 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_server, Server_republish);
     tcase_add_test(tc_server, Server_republish_invalid);
     tcase_add_test(tc_server, Server_deleteSubscription);
+    tcase_add_test(tc_server, Server_deleteSubscription_callbackSeesConsistentIndex);
     tcase_add_test(tc_server, Server_publishCallback);
     tcase_add_test(tc_server, Server_lifeTimeCount);
     tcase_add_test(tc_server, Server_invalidPublishingInterval);
     tcase_add_test(tc_server, Server_transferSubscriptionDiagnostics);
+#ifdef UA_ENABLE_DIAGNOSTICS
+    tcase_add_test(tc_server,
+                   Server_diagnosticsRejectLongBrowseNames);
+#endif
     tcase_add_test(tc_server, Server_transferSubscription_anonymous);
     tcase_add_test(tc_server, Server_setTriggering_nothingToDo);
     tcase_add_test(tc_server, Server_setTriggering_invalidSubscription);
@@ -1463,6 +2564,12 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_server, Server_modifyMonitoredItems_invalidSubscription);
     tcase_add_test(tc_server, Server_deleteMonitoredItems_invalidSubscription);
     tcase_add_test(tc_server, Server_transferSubscription_sendInitialValues);
+    tcase_add_test(tc_server, Server_transferSubscription_keepsMonitoredItemsTree);
+    tcase_add_test(tc_server, Server_deleteMonitoredItems_partial_keepsTreeConsistent);
+    tcase_add_test(tc_server, Server_subscriptionSurvivesSessionTimeoutButIsNotTransferable);
+    tcase_add_test(tc_server, Server_subscriptionRecoverableWithOverride);
+    tcase_add_test(tc_server, Server_dataSourceSamplingIntervalZero);
+    tcase_add_test(tc_server, Server_monitoredItems_sameNode_backpointer);
 #endif /* UA_ENABLE_SUBSCRIPTIONS */
     suite_add_tcase(s, tc_server);
 

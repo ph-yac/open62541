@@ -10,8 +10,9 @@
 #include <open62541/plugin/securitypolicy_default.h>
 
 #include "test_helpers.h"
-#include "ua_pubsub_internal.h"
+#include "pubsub_test_helpers.h"
 #include "ua_server_internal.h"
+#include "ua_pubsub_internal.h"
 
 #include <check.h>
 #include <stdlib.h>
@@ -23,15 +24,53 @@
 UA_Byte signingKey[UA_AES128CTR_SIGNING_KEY_LENGTH] = {0};
 UA_Byte encryptingKey[UA_AES128CTR_KEY_LENGTH] = {0};
 UA_Byte keyNonce[UA_AES128CTR_KEYNONCE_LENGTH] = {0};
+static size_t generatedNonces;
+
+static UA_StatusCode
+generateRepeatedNonce(UA_PubSubSecurityPolicy *policy, void *policyContext,
+                      UA_ByteString *out) {
+    (void)policy;
+    (void)policyContext;
+    memset(out->data, 0, out->length);
+    generatedNonces++;
+    return UA_STATUSCODE_GOOD;
+}
+
+static UA_StatusCode
+discardNetworkMessage(UA_ConnectionManager *cm, uintptr_t connectionId,
+                      const UA_KeyValueMap *params, UA_ByteString *buf) {
+    (void)params;
+    cm->freeNetworkBuffer(cm, connectionId, buf);
+    return UA_STATUSCODE_GOOD;
+}
 
 UA_Server *server = NULL;
 UA_NodeId connection1, connection2, writerGroup1, writerGroup2, writerGroup3,
         publishedDataSet1, publishedDataSet2, dataSetWriter1, dataSetWriter2, dataSetWriter3;
 
 static void setup(void) {
+    generatedNonces = 0;
     server = UA_Server_newForUnitTest();
     ck_assert(server != NULL);
     UA_ServerConfig *config = UA_Server_getConfig(server);
+
+    /* Discard outgoing packets so the test does not depend on the host's
+     * multicast routing configuration. */
+    UA_EventLoop *el = config->eventLoop;
+    UA_String udp = UA_STRING("udp");
+    UA_Boolean udpFound = false;
+    for(UA_EventSource *es = el->eventSources; es; es = es->next) {
+        if(es->eventSourceType != UA_EVENTSOURCETYPE_CONNECTIONMANAGER)
+            continue;
+        UA_ConnectionManager *cm = (UA_ConnectionManager*)es;
+        if(!UA_String_equal(&udp, &cm->protocol))
+            continue;
+        cm->sendWithConnection = discardNetworkMessage;
+        udpFound = true;
+        break;
+    }
+    ck_assert(udpFound);
+
     config->pubSubConfig.securityPolicies = (UA_PubSubSecurityPolicy*)
         UA_malloc(sizeof(UA_PubSubSecurityPolicy));
     config->pubSubConfig.securityPoliciesSize = 1;
@@ -43,7 +82,7 @@ static void setup(void) {
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
     connectionConfig.transportProfileUri = UA_STRING("http://opcfoundation.org/UA-Profile/Transport/pubsub-udp-uadp");
@@ -124,7 +163,13 @@ START_TEST(SinglePublishDataSetField) {
 
     UA_PubSubManager *psm = getPSM(server);
     UA_WriterGroup *wg = UA_WriterGroup_find(psm, writerGroup3);
+    ck_assert(wg != NULL);
+    config->pubSubConfig.securityPolicies[0].generateNonce = generateRepeatedNonce;
+    UA_UInt32 initialSequence = wg->nonceSequenceNumber;
     UA_WriterGroup_publishCallback(psm, wg);
+    UA_WriterGroup_publishCallback(psm, wg);
+    ck_assert_uint_eq(wg->nonceSequenceNumber, initialSequence + 2);
+    ck_assert_uint_eq(generatedNonces, 2);
     ck_assert_int_eq(retVal, UA_STATUSCODE_GOOD);
 } END_TEST
 

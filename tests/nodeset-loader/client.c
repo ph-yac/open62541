@@ -48,7 +48,6 @@ int main(int argc, char *argv[]) {
         nodeids = fopen(argv[i], "r");
         if(nodeids == NULL) {
             printf("Failed to open file: %s.\n", argv[i]);
-            fclose(nodeids);
             goto failure;
         }
 
@@ -81,6 +80,7 @@ int main(int argc, char *argv[]) {
             if(retval != UA_STATUSCODE_GOOD) {
                 printf("Invalid nodeid format.\n");
                 UA_NodeId_clear(&out);
+                free(nodeid);
                 fclose(nodeids);
                 goto failure;
             }
@@ -104,6 +104,7 @@ int main(int argc, char *argv[]) {
                 UA_BrowseRequest_clear(&bReq);
                 UA_BrowseResponse_clear(&bResp);
                 UA_NodeId_clear(&out);
+                free(nodeid);
                 fclose(nodeids);
                 goto failure;
             }
@@ -114,6 +115,7 @@ int main(int argc, char *argv[]) {
                     UA_BrowseRequest_clear(&bReq);
                     UA_BrowseResponse_clear(&bResp);
                     UA_NodeId_clear(&out);
+                    free(nodeid);
                     fclose(nodeids);
                     goto failure;
                 }
@@ -123,6 +125,7 @@ int main(int argc, char *argv[]) {
             UA_NodeId_clear(&out);
         }
 
+        free(nodeid);
         fclose(nodeids);
     }
 

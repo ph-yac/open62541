@@ -28,7 +28,9 @@
 #include <open62541/plugin/historydatabase.h>
 #endif
 
+/* Indexed by the AttributeId, which starts at 1 */
 static const UA_NodeAttributesMask attr2mask[28] = {
+    UA_NODEATTRIBUTESMASK_NONE,
     UA_NODEATTRIBUTESMASK_NODEID,
     UA_NODEATTRIBUTESMASK_NODECLASS,
     UA_NODEATTRIBUTESMASK_BROWSENAME,
@@ -60,7 +62,9 @@ static const UA_NodeAttributesMask attr2mask[28] = {
 
 static UA_UInt32
 attributeId2AttributeMask(UA_AttributeId id) {
-    if(UA_UNLIKELY(id > UA_ATTRIBUTEID_ACCESSLEVELEX))
+    /* The enum may be signed. The unsigned cast also rejects values that
+     * became negative when converting the wire-level UInt32. */
+    if(UA_UNLIKELY((UA_UInt32)id > UA_ATTRIBUTEID_ACCESSLEVELEX))
         return UA_NODEATTRIBUTESMASK_NONE;
     return attr2mask[id];
 }
@@ -374,6 +378,21 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
         return true;
     }
 
+    /* Browse permits reading every attribute except Value and
+     * RolePermissions, which have dedicated permission bits. */
+    if(session != &server->adminSession &&
+       id->attributeId != UA_ATTRIBUTEID_VALUE &&
+       id->attributeId != UA_ATTRIBUTEID_ROLEPERMISSIONS &&
+       (!session || !server->config.accessControl.allowBrowseNode(
+            server, &server->config.accessControl,
+            &session->sessionId, session->context,
+            &node->head.nodeId, node->head.context))) {
+        v->hasStatus = true;
+        v->status = UA_STATUSCODE_BADUSERACCESSDENIED;
+        addMissingTimestamps(server, v, timestampsToReturn, id);
+        return true;
+    }
+
     /* Read the attribute */
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     switch(id->attributeId) {
@@ -558,6 +577,7 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
             memmove(ed, &ed->enumDefinition, sizeof(UA_EnumDefinition));
             UA_Variant_setScalar(&v->value, ed, &UA_TYPES[UA_TYPES_ENUMDEFINITION]);
         } else {
+            UA_ExtensionObject_clear(&typeDescr);
             retval = UA_STATUSCODE_BADATTRIBUTEIDINVALID;
         }
 #else
@@ -1206,7 +1226,7 @@ adjustValueType(UA_Server *server, UA_Variant *value,
 
     /* Find the target type */
     const UA_DataType *targetType =
-        UA_findDataTypeWithCustom(targetDataTypeId, server->config.customDataTypes);
+        UA_findDataTypeWithCustom(targetDataTypeId, serverCustomTypes(server));
     if(!targetType)
         return;
 
@@ -1671,8 +1691,9 @@ updateLocalizedText(const UA_LocalizedText *source, UA_LocalizedText *target) {
 static void
 triggerImmediateDataChange(UA_Server *server, UA_Session *session,
                            UA_Node *node, const UA_WriteValue *wvalue) {
-    UA_MonitoredItem *mon = node->head.monitoredItems;
-    for(; mon != NULL; mon = mon->sampling.nodeListNext) {
+    UA_MonitoredItem *mon;
+    LIST_FOREACH(mon, (UA_MonitoredItemList*)&node->head.monitoredItems,
+                 sampling.nodeListEntry) {
         if(mon->itemToMonitor.attributeId != wvalue->attributeId)
             continue;
         /* TODO: Allow async read for datachanges */
@@ -1780,8 +1801,12 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
                 retval = UA_STATUSCODE_BADUSERACCESSDENIED;
                 break;
             }
-            /* Writing the StatusCode requires the StatusWrite bit */
-            if(wvalue->value.hasStatus) {
+            /* Writing a StatusCode different to "Good" requires the
+             * StatusWrite bit (see OPC specification 10000-3: AccessLevelType;
+             * https://reference.opcfoundation.org/specs/OPC-10000-3/v1.05.06/8.57)
+             */
+            if(   (wvalue->value.hasStatus)
+               && (wvalue->value.status != UA_STATUSCODE_GOOD)) {
                 accessLevel = getAccessLevel(server, session, &node->variableNode);
                 if(!(accessLevel & UA_ACCESSLEVELMASK_STATUSWRITE)) {
                     retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
@@ -1793,8 +1818,13 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
                     break;
                 }
             }
-            /* Writing the SourceTimestamp requires the TimestampWrite bit */
-            if(wvalue->value.hasSourceTimestamp) {
+            /* Writing a SourceTimestamp different to NULL requires the
+             * TimestampWrite bit (see OPC specification 10000-3:
+             * AccessLevelType;
+             * https://reference.opcfoundation.org/specs/OPC-10000-3/v1.05.06/8.57)
+             */
+            if(   (wvalue->value.hasSourceTimestamp)
+               && (wvalue->value.sourceTimestamp != (UA_DateTime)(0))) {
                 accessLevel = getAccessLevel(server, session, &node->variableNode);
                 if(!(accessLevel & UA_ACCESSLEVELMASK_TIMESTAMPWRITE)) {
                     retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
@@ -2185,6 +2215,11 @@ Service_HistoryRead(UA_Server *server, UA_Session *session,
 
     for(size_t i = 0; i < response->resultsSize; ++i) {
         void * data = UA_new(historyDataType);
+        if(!data) {
+            UA_free(historyData);
+            response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
+            return true;
+        }
         UA_ExtensionObject_setValue(&response->results[i].historyData,
                                     data, historyDataType);
         historyData[i] = data;

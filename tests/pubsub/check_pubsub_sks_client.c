@@ -14,8 +14,9 @@
 #include <open62541/plugin/certificategroup_default.h>
 
 #include "test_helpers.h"
-#include "ua_pubsub_internal.h"
+#include "pubsub_test_helpers.h"
 #include "ua_pubsub_keystorage.h"
+#include "ua_pubsub_internal.h"
 #include "ua_server_internal.h"
 
 #include <check.h>
@@ -214,8 +215,7 @@ publishersetup(void) {
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {
-        UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
     connectionConfig.transportProfileUri =
@@ -244,8 +244,7 @@ subscribersetup(void) {
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {
-        UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
     connectionConfig.transportProfileUri =
@@ -530,6 +529,8 @@ START_TEST(AddValidSksClientwithWriterGroup) {
     UA_StatusCode retval = UA_STATUSCODE_BAD;
     int retryCnt = 0;
     UA_ClientConfig *config = newEncryptedClientConfig("user1", "password");
+    UA_ClientConfig_PolicyHistory *policyHistory = config->securityPolicyHistory;
+    ck_assert_ptr_ne(policyHistory, NULL);
 
     retval = addPublisher(publisherApp);
     ck_assert(retval == UA_STATUSCODE_GOOD);
@@ -547,6 +548,7 @@ START_TEST(AddValidSksClientwithWriterGroup) {
 
     retval = UA_Server_setSksClient(publisherApp, securityGroupId, config,
                                     testingSKSEndpointUrl, sksPullRequestCallback_publisher, NULL);
+    ck_assert_ptr_eq(config->securityPolicyHistory, NULL);
     ck_assert_msg(retval == UA_STATUSCODE_GOOD,
                   "Expected Statuscode to be Good, but failed with: %s ",
                   UA_StatusCode_name(retval));
@@ -560,6 +562,8 @@ START_TEST(AddValidSksClientwithWriterGroup) {
     UA_PubSubManager *psm = getPSM(publisherApp);
     UA_WriterGroup *wg = UA_WriterGroup_find(psm, writerGroupId);
     ck_assert(wg != NULL);
+    ck_assert_ptr_eq(wg->keyStorage->sksConfig.clientConfig.securityPolicyHistory,
+                     policyHistory);
     
     ck_assert(wg->keyStorage->keyListSize > 0);
     lockServer(sksServer);
@@ -677,6 +681,44 @@ START_TEST(SetWrongSKSEndpointUrl) {
                   "Expected Statuscode to be BADCONNECTIONCLOSED, but failed with: %s ",
                   UA_StatusCode_name(retval));
     UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(DeleteKeyStorageWhileSksConnectIsPending) {
+    UA_StatusCode retval = addPublisher(publisherApp);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_ClientConfig *config = newEncryptedClientConfig("user1", "password");
+    ck_assert_ptr_ne(config, NULL);
+    retval = UA_Server_setSksClient(publisherApp, securityGroupId, config,
+                                    testingSKSEndpointUrl,
+                                    sksPullRequestCallback_publisher, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    retval = UA_Server_removeWriterGroup(publisherApp, writerGroupId);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    for(size_t i = 0; i < 20; i++)
+        UA_Server_run_iterate(publisherApp, false);
+
+    UA_PubSubManager *psm = getPSM(publisherApp);
+    lockServer(publisherApp);
+    ck_assert_ptr_eq(UA_PubSubKeyStorage_find(psm, securityGroupId), NULL);
+    unlockServer(publisherApp);
+    UA_free(config);
+}
+END_TEST
+
+START_TEST(ShutdownWhileSksConnectIsPending) {
+    UA_StatusCode retval = addPublisher(publisherApp);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_ClientConfig *config = newEncryptedClientConfig("user1", "password");
+    ck_assert_ptr_ne(config, NULL);
+    retval = UA_Server_setSksClient(publisherApp, securityGroupId, config,
+                                    testingSKSEndpointUrl,
+                                    sksPullRequestCallback_publisher, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    UA_free(config);
 }
 END_TEST
 
@@ -978,6 +1020,9 @@ main(void) {
     tcase_add_test(tc_pubsub_sks_client, SetInvalidSKSClient);
     tcase_add_test(tc_pubsub_sks_client, SetInvalidSKSEndpointUrl);
     tcase_add_test(tc_pubsub_sks_client, SetWrongSKSEndpointUrl);
+    tcase_add_test(tc_pubsub_sks_client,
+                   DeleteKeyStorageWhileSksConnectIsPending);
+    tcase_add_test(tc_pubsub_sks_client, ShutdownWhileSksConnectIsPending);
     tcase_add_test(tc_pubsub_sks_client, CheckPublishedValuesInUserLand);
     tcase_add_test(tc_pubsub_sks_client, PublisherSubscriberTogethor);
     tcase_add_test(tc_pubsub_sks_client, PublisherDelayedSubscriberTogethor);

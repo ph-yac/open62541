@@ -37,7 +37,8 @@ typedef struct UA_Client_NotificationsAckNumber {
 typedef struct UA_Client_MonitoredItem {
     ZIP_ENTRY(UA_Client_MonitoredItem) zipfields;
     UA_UInt32 monitoredItemId;
-    UA_UInt32 clientHandle;
+    UA_MonitoringParameters parameters;
+    UA_MonitoringParameters pendingParameters;
     void *context;
     UA_Client_DeleteMonitoredItemCallback deleteCallback;
     union {
@@ -45,8 +46,7 @@ typedef struct UA_Client_MonitoredItem {
         UA_Client_EventNotificationCallback eventCallback;
     } handler;
     UA_Boolean isEventMonitoredItem; /* Otherwise a DataChange MoniitoredItem */
-
-    UA_KeyValueMap eventFields; /* Cached names */
+    UA_KeyValueMap eventFields; /* Lazily cached names for the active filter */
 } UA_Client_MonitoredItem;
 
 ZIP_HEAD(MonitorItemsTree, UA_Client_MonitoredItem);
@@ -63,6 +63,10 @@ typedef struct UA_Client_Subscription {
     UA_UInt32 sequenceNumber;
     UA_DateTime lastActivity;
     MonitorItemsTree monitoredItems;
+    size_t pendingRekeys; /* MonitoredItems with a pending clientHandle
+                           * re-key (pendingParameters.clientHandle != 0).
+                           * Gates the O(n) fallback scan in the
+                           * notification dispatch. */
 } UA_Client_Subscription;
 
 void
@@ -77,6 +81,12 @@ __Client_Subscriptions_backgroundPublish(UA_Client *client);
 
 void
 __Client_Subscriptions_backgroundPublishInactivityCheck(UA_Client *client);
+
+/* Exposed for unit tests and fuzzing of notification ordering */
+void
+__Client_Subscriptions_processPublishResponse(UA_Client *client,
+                                              UA_PublishRequest *request,
+                                              UA_PublishResponse *response);
 
 /**********/
 /* Client */
@@ -242,6 +252,7 @@ UA_StatusCode connectInternal(UA_Client *client, UA_Boolean async);
 UA_StatusCode connectSecureChannel(UA_Client *client, const char *endpointUrl);
 UA_Boolean isFullyConnected(UA_Client *client);
 void connectSync(UA_Client *client);
+void setConnectStatus(UA_Client *client, UA_StatusCode status);
 void notifyClientState(UA_Client *client);
 void processRHEMessage(UA_Client *client, const UA_ByteString *chunk);
 void processERRResponse(UA_Client *client, const UA_ByteString *chunk);

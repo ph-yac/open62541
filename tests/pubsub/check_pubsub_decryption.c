@@ -9,8 +9,9 @@
 #include <open62541/server_config_default.h>
 #include <open62541/server_pubsub.h>
 
-#include "ua_pubsub_internal.h"
+#include "pubsub_test_helpers.h"
 #include "ua_server_internal.h"
+#include "ua_pubsub_internal.h"
 #include "test_helpers.h"
 
 #include <check.h>
@@ -64,8 +65,7 @@ setup(void) {
     UA_PubSubConnectionConfig connectionConfig;
     memset(&connectionConfig, 0, sizeof(UA_PubSubConnectionConfig));
     connectionConfig.name = UA_STRING("UADP Connection");
-    UA_NetworkAddressUrlDataType networkAddressUrl = {
-        UA_STRING_NULL, UA_STRING("opc.udp://224.0.0.22:4840/")};
+    UA_NetworkAddressUrlDataType networkAddressUrl = UA_PUBSUB_TEST_NETWORKADDRESSURL(UA_PUBSUB_TEST_UDP_MULTICAST_URL_4840);
     UA_Variant_setScalar(&connectionConfig.address, &networkAddressUrl,
                          &UA_TYPES[UA_TYPES_NETWORKADDRESSURLDATATYPE]);
     connectionConfig.transportProfileUri =
@@ -397,6 +397,30 @@ START_TEST(InvalidSignature) {
 }
 END_TEST
 
+START_TEST(ShortSignedNetworkMessage) {
+    UA_FieldMetaData *fields = newReaderGroupWithSecurity(
+        UA_MESSAGESECURITYMODE_SIGNANDENCRYPT);
+    UA_PubSubManager *psm = getPSM(server);
+    UA_ReaderGroup *rg = UA_ReaderGroup_find(psm, readerGroupId);
+    ck_assert_ptr_ne(rg, NULL);
+
+    UA_ByteString buffer;
+    buffer.length = (sizeof(MSG_HEADER) - 1) / 2;
+    buffer.data = hexstr_to_char(MSG_HEADER);
+
+    UA_NetworkMessage msg;
+    memset(&msg, 0, sizeof(UA_NetworkMessage));
+
+    UA_StatusCode rv = UA_ReaderGroup_decodeNetworkMessage(psm, rg, buffer, &msg);
+    ck_assert(rv == UA_STATUSCODE_BADSECURITYCHECKSFAILED);
+
+    UA_NetworkMessage_clear(&msg);
+
+    UA_free(fields);
+    free(buffer.data);
+}
+END_TEST
+
 START_TEST(InvalidSecurityModeInsufficientSig) {
     UA_FieldMetaData *fields = newReaderGroupWithSecurity(UA_MESSAGESECURITYMODE_NONE);
     UA_PubSubManager *psm = getPSM(server);
@@ -486,6 +510,7 @@ main(void) {
     TCase *tc_pubsub_subscribe_invalid_sig = tcase_create("PubSub Subscribe Invalid Signature");
     tcase_add_checked_fixture(tc_pubsub_subscribe_invalid_sig, setup, teardown);
     tcase_add_test(tc_pubsub_subscribe_invalid_sig, InvalidSignature);
+    tcase_add_test(tc_pubsub_subscribe_invalid_sig, ShortSignedNetworkMessage);
 
     TCase *tc_pubsub_subscribe_invalid_securitymode =
         tcase_create("PubSub Subscribe Invalid SecurityMode");

@@ -40,6 +40,10 @@ UA_ClientConfig_copy(UA_ClientConfig const *src, UA_ClientConfig *dst){
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
 
+    retval = UA_String_copy(&src->endpointUrl, &dst->endpointUrl);
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+
     retval = UA_ExtensionObject_copy(&src->userIdentityToken, &dst->userIdentityToken);
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
@@ -56,12 +60,39 @@ UA_ClientConfig_copy(UA_ClientConfig const *src, UA_ClientConfig *dst){
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
 
+    retval = UA_String_copy(&src->applicationUri, &dst->applicationUri);
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+
+    retval = UA_String_copy(&src->authSecurityPolicyUri,
+                            &dst->authSecurityPolicyUri);
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+
+    retval = UA_String_copy(&src->sessionName, &dst->sessionName);
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+
     retval = UA_Array_copy(src->sessionLocaleIds, src->sessionLocaleIdsSize,
                            (void **)&dst->sessionLocaleIds, &UA_TYPES[UA_TYPES_LOCALEID]);
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
 
     dst->sessionLocaleIdsSize = src->sessionLocaleIdsSize;
+    retval = UA_Array_copy(src->namespaces, src->namespacesSize,
+                           (void**)&dst->namespaces, &UA_TYPES[UA_TYPES_STRING]);
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+    dst->namespacesSize = src->namespacesSize;
+    dst->tcpReuseAddr = src->tcpReuseAddr;
+    dst->allowNonePolicyPassword = src->allowNonePolicyPassword;
+    dst->globalNotificationCallback = src->globalNotificationCallback;
+    dst->lifecycleNotificationCallback = src->lifecycleNotificationCallback;
+    dst->serviceNotificationCallback = src->serviceNotificationCallback;
+#ifdef UA_ENABLE_ENCRYPTION
+    dst->maxTrustListSize = src->maxTrustListSize;
+    dst->maxRejectedListSize = src->maxRejectedListSize;
+#endif
     dst->connectivityCheckInterval = src->connectivityCheckInterval;
     dst->certificateVerification = src->certificateVerification;
     dst->clientContext = src->clientContext;
@@ -71,6 +102,9 @@ UA_ClientConfig_copy(UA_ClientConfig const *src, UA_ClientConfig *dst){
     dst->inactivityCallback = src->inactivityCallback;
     dst->localConnectionConfig = src->localConnectionConfig;
     dst->logging = src->logging;
+    dst->noSession = src->noSession;
+    dst->noReconnect = src->noReconnect;
+    dst->noNewSession = src->noNewSession;
     if(src->certificateVerification.logging == NULL)
         dst->certificateVerification.logging = dst->logging;
 #ifdef UA_ENABLE_SUBSCRIPTIONS
@@ -84,11 +118,14 @@ UA_ClientConfig_copy(UA_ClientConfig const *src, UA_ClientConfig *dst){
     dst->subscriptionInactivityCallback = src->subscriptionInactivityCallback;
 #endif
     dst->timeout = src->timeout;
-    dst->userTokenPolicy = src->userTokenPolicy;
     dst->securityPolicies = src->securityPolicies;
     dst->securityPoliciesSize = src->securityPoliciesSize;
+    dst->securityPolicyHistory = src->securityPolicyHistory;
     dst->authSecurityPolicies = src->authSecurityPolicies;
     dst->authSecurityPoliciesSize = src->authSecurityPoliciesSize;
+#ifdef UA_ENABLE_ENCRYPTION
+    dst->privateKeyPasswordCallback = src->privateKeyPasswordCallback;
+#endif
 
 cleanup:
     if(retval != UA_STATUSCODE_GOOD) {
@@ -98,6 +135,7 @@ cleanup:
         dst->eventLoop = NULL;
         dst->logging = NULL;
         dst->securityPolicies = NULL;
+        dst->securityPolicyHistory = NULL;
         UA_ClientConfig_clear(dst);
     }
     return retval;
@@ -132,7 +170,7 @@ UA_Client_newWithConfig(const UA_ClientConfig *config) {
     client->namespaces[0] = UA_STRING_ALLOC("http://opcfoundation.org/UA/");
     client->namespaces[1] = UA_STRING_NULL; /* Gets set when we connect to the server */
     for(size_t i = 0; i < config->namespacesSize; i++) {
-        res |= UA_String_copy(&client->namespaces[i+2], &config->namespaces[i]);
+        res |= UA_String_copy(&config->namespaces[i], &client->namespaces[i+2]);
     }
     if(res != UA_STATUSCODE_GOOD)
         goto error;
@@ -177,6 +215,15 @@ UA_ClientConfig_clear(UA_ClientConfig *config) {
         config->securityPolicies = 0;
     }
 
+    while(config->securityPolicyHistory) {
+        UA_ClientConfig_PolicyHistory *previous = config->securityPolicyHistory;
+        config->securityPolicyHistory = previous->next;
+        for(size_t i = 0; i < previous->policiesSize; i++)
+            previous->policies[i].clear(&previous->policies[i]);
+        UA_free(previous->policies);
+        UA_free(previous);
+    }
+
     /* Stop and delete the EventLoop */
     UA_EventLoop *el = config->eventLoop;
     if(el && !config->externalEventLoop) {
@@ -203,6 +250,12 @@ UA_ClientConfig_clear(UA_ClientConfig *config) {
     }
     config->sessionLocaleIds = NULL;
     config->sessionLocaleIdsSize = 0;
+
+    UA_Array_delete(config->namespaces, config->namespacesSize, &UA_TYPES[UA_TYPES_STRING]);
+    config->namespaces = NULL;
+    config->namespacesSize = 0;
+    config->securityPoliciesSize = 0;
+    config->authSecurityPoliciesSize = 0;
 
     /* Custom Data Types */
     UA_cleanupDataTypeWithCustom(config->customDataTypes);
@@ -305,12 +358,23 @@ UA_Client_getConfig(UA_Client *client) {
 
 #if UA_LOGLEVEL <= 300
 static const char *channelStateTexts[14] = {
-    "Fresh", "ReverseListening", "Connecting", "Connected", "ReverseConnected", "RHESent", "HELSent", "HELReceived", "ACKSent",
-    "AckReceived", "OPNSent", "Open", "Closing", "Closed"};
+    "Closed", "ReverseListening", "Connecting", "Connected", "ReverseConnected", "RHESent", "HELSent", "HELReceived", "ACKSent",
+    "AckReceived", "OPNSent", "Open", "Closing"};
 static const char *sessionStateTexts[6] =
     {"Closed", "CreateRequested", "Created",
      "ActivateRequested", "Activated", "Closing"};
 #endif
+
+void
+setConnectStatus(UA_Client *client, UA_StatusCode status) {
+    UA_LOCK_ASSERT(&client->clientMutex);
+
+    client->connectStatus = status;
+    if(status != UA_STATUSCODE_GOOD)
+        closeSecureChannel(client);
+
+    notifyClientState(client);
+}
 
 void
 notifyClientState(UA_Client *client) {
@@ -462,6 +526,10 @@ processMSGResponse(UA_Client *client, UA_UInt32 requestId,
     UA_Response asyncResponse;
     UA_Response *response = (ac->syncResponse) ? ac->syncResponse : &asyncResponse;
     const UA_DataType *responseType = ac->responseType;
+    /* Also initialize before decoding the type NodeId: errors there already
+     * invoke the callback and clear the response. ServiceFault decoding only
+     * initializes the header, so initialize the full expected response type. */
+    UA_init(response, responseType);
 
     /* Dequeue ac. We might disconnect the client (remove all ac) in the callback. */
     LIST_REMOVE(ac, pointers);
@@ -475,10 +543,6 @@ processMSGResponse(UA_Client *client, UA_UInt32 requestId,
 
     /* Verify the type of the response */
     if(!UA_NodeId_equal(&responseTypeId, &ac->responseType->binaryEncodingId)) {
-        /* Initialize before switching the responseType to ServiceFault.
-         * Otherwise the decoding will leave fields from the original response
-         * type uninitialized. */
-        UA_init(response, ac->responseType);
         if(UA_NodeId_equal(&responseTypeId, &serviceFaultId)) {
             /* Decode as a ServiceFault, i.e. only the response header */
             UA_LOG_DEBUG(config->logging, UA_LOGCATEGORY_CLIENT,
@@ -505,6 +569,7 @@ processMSGResponse(UA_Client *client, UA_UInt32 requestId,
     UA_DecodeBinaryOptions opt;
     memset(&opt, 0, sizeof(UA_DecodeBinaryOptions));
     opt.customTypes = config->customDataTypes;
+    opt.namespaceMapping = client->channel.namespaceMapping;
     retval = UA_decodeBinaryInternal(msg, &offset, response, responseType, &opt);
 
  process:
@@ -1007,6 +1072,12 @@ __Client_backgroundConnectivity(UA_Client *client) {
     if(!client->config.connectivityCheckInterval)
         return;
 
+    /* Only probe the server once the Session is activated. A Read sent
+     * before the server returns ActivateSessionResponse triggers a
+     * ServiceFault that aborts a slow connect (issue #8195). */
+    if(client->sessionState != UA_SESSIONSTATE_ACTIVATED)
+        return;
+
     if(client->pendingConnectivityCheck)
         return;
 
@@ -1486,8 +1557,8 @@ UA_Client_Service_queryFirst(UA_Client *client,
 UA_QueryNextResponse
 UA_Client_Service_queryNext(UA_Client *client, const UA_QueryNextRequest request) {
     UA_QueryNextResponse response;
-    __UA_Client_Service(client, &request, &UA_TYPES[UA_TYPES_QUERYFIRSTREQUEST],
-                        &response, &UA_TYPES[UA_TYPES_QUERYFIRSTRESPONSE]);
+    __UA_Client_Service(client, &request, &UA_TYPES[UA_TYPES_QUERYNEXTREQUEST],
+                        &response, &UA_TYPES[UA_TYPES_QUERYNEXTRESPONSE]);
     return response;
 }
 

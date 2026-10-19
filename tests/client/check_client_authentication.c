@@ -93,6 +93,18 @@ static void teardown(void) {
     UA_Server_delete(server);
 }
 
+static void
+assertCertificateUserId(const UA_Client *client) {
+    UA_Variant userId;
+    UA_Variant_init(&userId);
+    UA_StatusCode res = UA_Server_getSessionAttributeCopy(
+        server, &client->sessionId, UA_QUALIFIEDNAME(0, "clientUserId"), &userId);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+    ck_assert(UA_Variant_hasScalarType(&userId, &UA_TYPES[UA_TYPES_STRING]));
+    ck_assert_uint_gt(((UA_String*)userId.data)->length, 0);
+    UA_Variant_clear(&userId);
+}
+
 START_TEST(Client_connect_certificate) {
     /* Load client certificate and private key for the SecureChannel */
     UA_ByteString certificate;
@@ -200,14 +212,20 @@ START_TEST(client_connect_none_username_basic256Sha256) {
         UA_String_clear(&cc->clientDescription.applicationUri);
         cc->clientDescription.applicationUri = UA_STRING_ALLOC("urn:open62541.server.application");
 
-        /* Only use the relevant security policy in authSecurityPolicies */
-        for(size_t i = 0; i < cc->securityPoliciesSize; ++i)
+        /* Rebind the SecureChannel None policy with the client certificate */
+        for(size_t i = 0; i < cc->securityPoliciesSize; ++i) {
             cc->securityPolicies[i].clear(&cc->securityPolicies[i]);
-        UA_free(cc->securityPolicies);
-        cc->securityPolicies = (UA_SecurityPolicy*)UA_calloc(2, sizeof(UA_SecurityPolicy));
-        cc->securityPoliciesSize = 2;
-        UA_SecurityPolicy_None(&cc->securityPolicies[0], certificate, cc->logging);
-        UA_SecurityPolicy_Basic256Sha256(&cc->securityPolicies[1], certificate, privateKey, cc->logging);
+            UA_SecurityPolicy_None(&cc->securityPolicies[i], certificate, cc->logging);
+        }
+
+        /* Use the relevant security policies in authSecurityPolicies */
+        for(size_t i = 0; i < cc->authSecurityPoliciesSize; ++i)
+            cc->authSecurityPolicies[i].clear(&cc->authSecurityPolicies[i]);
+        UA_free(cc->authSecurityPolicies);
+        cc->authSecurityPolicies = (UA_SecurityPolicy*)UA_calloc(2, sizeof(UA_SecurityPolicy));
+        cc->authSecurityPoliciesSize = 2;
+        UA_SecurityPolicy_None(&cc->authSecurityPolicies[0], certificate, cc->logging);
+        UA_SecurityPolicy_Basic256Sha256(&cc->authSecurityPolicies[1], certificate, privateKey, cc->logging);
 
         UA_StatusCode retval = UA_Client_connectUsername(client, "opc.tcp://localhost:4840", "admin", "admin");
 
@@ -272,18 +290,32 @@ START_TEST(client_connect_none_username_eccpnist256) {
 
     /* Only use the relevant security policy in authSecurityPolicies */
     for(size_t i = 0; i < cc->authSecurityPoliciesSize; ++i)
-        cc->securityPolicies[i].clear(&cc->securityPolicies[i]);
-    UA_free(cc->securityPolicies);
-    cc->securityPolicies = (UA_SecurityPolicy*)UA_calloc(2, sizeof(UA_SecurityPolicy));
-    cc->securityPoliciesSize = 2;
-    UA_SecurityPolicy_None(&cc->securityPolicies[0], certificate, cc->logging);
-    UA_SecurityPolicy_EccNistP256(&cc->securityPolicies[1],
+        cc->authSecurityPolicies[i].clear(&cc->authSecurityPolicies[i]);
+    UA_free(cc->authSecurityPolicies);
+    cc->authSecurityPolicies = (UA_SecurityPolicy*)UA_calloc(2, sizeof(UA_SecurityPolicy));
+    cc->authSecurityPoliciesSize = 2;
+    UA_SecurityPolicy_None(&cc->authSecurityPolicies[0], certificate, cc->logging);
+    UA_SecurityPolicy_EccNistP256(&cc->authSecurityPolicies[1],
                                   UA_APPLICATIONTYPE_CLIENT,
                                   certificate, privateKey, cc->logging);
 
+    /* Rebind the SecureChannel None policy with the client certificate so the
+     * server can determine the session-level SecurityPolicy for ECC */
+    for(size_t i = 0; i < cc->securityPoliciesSize; ++i)
+        cc->securityPolicies[i].clear(&cc->securityPolicies[i]);
+    UA_free(cc->securityPolicies);
+    cc->securityPolicies = (UA_SecurityPolicy*)UA_calloc(1, sizeof(UA_SecurityPolicy));
+    cc->securityPoliciesSize = 1;
+    UA_SecurityPolicy_None(&cc->securityPolicies[0], certificate, cc->logging);
+
     UA_StatusCode retval = UA_Client_connectUsername(client, "opc.tcp://localhost:4840", "admin", "admin");
 
-    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    /* ECC (and RSA-DH) policies must NOT be used to secure a UserIdentityToken
+     * over a #None SecureChannel: they rely on ephemeral key agreement that
+     * must be bound to a secured channel. With only an ECC policy available the
+     * server has no static-RSA policy to encrypt the password, so it does not
+     * offer the username UserTokenPolicy and the connect is rejected. */
+    ck_assert_uint_ne(retval, UA_STATUSCODE_GOOD);
 
     UA_Client_disconnect(client);
     UA_Client_delete(client);
@@ -410,12 +442,14 @@ START_TEST(client_connect_basic256Sha256_anonymous) {
     UA_String_clear(&cc->clientDescription.applicationUri);
     cc->clientDescription.applicationUri = UA_STRING_ALLOC("urn:open62541.server.application");
 
-    /* Use empty security policies array */
+    /* Override authSecurityPolicies with Basic256Sha256 so that an
+     * anonymous token can be matched against it */
     for(size_t i = 0; i < cc->authSecurityPoliciesSize; ++i)
         cc->authSecurityPolicies[i].clear(&cc->authSecurityPolicies[i]);
     UA_free(cc->authSecurityPolicies);
-    cc->authSecurityPolicies = NULL;
-    cc->authSecurityPoliciesSize = 0;
+    cc->authSecurityPolicies = (UA_SecurityPolicy*)UA_calloc(1, sizeof(UA_SecurityPolicy));
+    cc->authSecurityPoliciesSize = 1;
+    UA_SecurityPolicy_Basic256Sha256(&cc->authSecurityPolicies[0], certificate, privateKey, cc->logging);
 
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
 
@@ -463,6 +497,7 @@ START_TEST(client_authenticate_with_certificate) {
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
 
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    assertCertificateUserId(client);
 
     UA_Client_disconnect(client);
     UA_Client_delete(client);
@@ -506,6 +541,7 @@ START_TEST(client_authenticate_none_with_certificate) {
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
 
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    assertCertificateUserId(client);
 
     UA_Client_disconnect(client);
     UA_Client_delete(client);

@@ -9,6 +9,7 @@
  * Copyright (c) 2020 Thomas Fischer, Siemens AG
  * Copyright (c) 2021 Fraunhofer IOSB (Author: Jan Hermes)
  * Copyright (c) 2022 Linutronix GmbH (Author: Muddasir Shakil)
+ * Copyright 2025 (c) o6 Automation GmbH (Author: Andreas Ebner)
  */
 
 #include "ua_pubsub_internal.h"
@@ -30,8 +31,8 @@ static UA_StatusCode
 generateNetworkMessage(UA_PubSubConnection *connection, UA_WriterGroup *wg,
                        UA_DataSetMessage *dsm, UA_UInt16 *writerIds, UA_Byte dsmCount,
                        UA_ExtensionObject *messageSettings,
-                       UA_ExtensionObject *transportSettings,
-                       UA_NetworkMessage *networkMessage);
+                        UA_ExtensionObject *transportSettings,
+                         UA_NetworkMessage *networkMessage);
 
 static void
 UA_WriterGroup_disconnect(UA_WriterGroup *wg);
@@ -193,7 +194,8 @@ UA_WriterGroup_create(UA_PubSubManager *psm, const UA_NodeId connection,
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
     res = addWriterGroupRepresentation(psm->sc.server, wg);
     if(res != UA_STATUSCODE_GOOD) {
-        UA_WriterGroup_remove(psm, wg);
+        UA_PubSubComponent_freeWithoutLifecycleCallback(
+            psm, wg, UA_PUBSUBCOMPONENT_WRITERGROUP);
         return res;
     }
 #else
@@ -211,7 +213,8 @@ UA_WriterGroup_create(UA_PubSubManager *psm, const UA_NodeId connection,
     if(res != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR_PUBSUB(psm->logging, wg,
                             "Could not validate the connection parameters");
-        UA_WriterGroup_remove(psm, wg);
+        UA_PubSubComponent_freeWithoutLifecycleCallback(
+            psm, wg, UA_PUBSUBCOMPONENT_WRITERGROUP);
         return res;
     }
 
@@ -221,7 +224,8 @@ UA_WriterGroup_create(UA_PubSubManager *psm, const UA_NodeId connection,
         res = writerGroupAttachSKSKeystorage(psm, wg);
         if(res != UA_STATUSCODE_GOOD) {
             UA_LOG_ERROR_PUBSUB(psm->logging, wg, "Attaching the SKS KeyStorage failed");
-            UA_WriterGroup_remove(psm, wg);
+            UA_PubSubComponent_freeWithoutLifecycleCallback(
+                psm, wg, UA_PUBSUBCOMPONENT_WRITERGROUP);
             return res;
         }
     }
@@ -235,7 +239,10 @@ UA_WriterGroup_create(UA_PubSubManager *psm, const UA_NodeId connection,
             componentLifecycleCallback(server, wg->head.identifier,
                                        UA_PUBSUBCOMPONENT_WRITERGROUP, false);
         if(res != UA_STATUSCODE_GOOD) {
-            UA_WriterGroup_remove(psm, wg);
+            /* The app refused the component; free without re-asking the
+             * lifecycle callback (it would re-reject and leak the group). */
+            UA_PubSubComponent_freeWithoutLifecycleCallback(
+                psm, wg, UA_PUBSUBCOMPONENT_WRITERGROUP);
             return res;
         }
     }
@@ -703,6 +710,11 @@ generateNetworkMessage(UA_PubSubConnection *connection, UA_WriterGroup *wg,
                        UA_ExtensionObject *messageSettings,
                        UA_ExtensionObject *transportSettings,
                        UA_NetworkMessage *nm) {
+    /* Defense-in-depth: the dataSetWriterIds array in UA_NetworkMessage is
+     * fixed at UA_NETWORKMESSAGE_MAXMESSAGECOUNT (32) entries. Reject callers
+     * that would overflow it. */
+    if(dsmCount >= UA_NETWORKMESSAGE_MAXMESSAGECOUNT)
+        return UA_STATUSCODE_BADINTERNALERROR;
     UA_UadpWriterGroupMessageDataType tmpWgm;
     UA_UadpWriterGroupMessageDataType *wgm;
     if(UA_ExtensionObject_hasDecodedType(messageSettings,
@@ -767,6 +779,8 @@ generateNetworkMessage(UA_PubSubConnection *connection, UA_WriterGroup *wg,
         const UA_Byte *end = &nm->securityHeader.messageNonce[8];
         UA_UInt32_encodeBinary(&wg->nonceSequenceNumber, &pos, end);
         nm->securityHeader.messageNonceSize = 8;
+        /* Part of the MessageNonce that makes it unique for a given key */
+        wg->nonceSequenceNumber++;
     }
 
     nm->version = 1;
@@ -836,10 +850,11 @@ sendNetworkMessageBinary(UA_PubSubManager *psm, UA_PubSubConnection *connection,
         return UA_STATUSCODE_BADINTERNALERROR;
 
     /* Add the overhead for the security signature.
-     * There is no padding and the encryption incurs no size overhead. */
+     * There is no padding and the encryption incurs no size overhead. Use the
+     * same WriterGroup context as the signing operation below. */
     if(wg->config.securityMode > UA_MESSAGESECURITYMODE_NONE) {
         UA_PubSubSecurityPolicy *sp = wg->config.securityPolicy;
-        msgSize += sp->getSignatureSize(sp, sp->policyContext);
+        msgSize += sp->getSignatureSize(sp, wg->securityPolicyContext);
     }
 
     UA_ConnectionManager *cm = connection->cm;
@@ -1427,8 +1442,9 @@ UA_Server_triggerWriterGroupPublish(UA_Server *server,
         unlockServer(server);
         return UA_STATUSCODE_BADNOTFOUND;
     }
-    unlockServer(server);
+    /* Keep the WriterGroup alive until publishing has completed */
     UA_WriterGroup_publishCallback(psm, wg);
+    unlockServer(server);
     return UA_STATUSCODE_GOOD;
 }
 
@@ -1605,6 +1621,18 @@ UA_Server_computeWriterGroupOffsetTable(UA_Server *server,
     }
 
     /* Generate the NetworkMessage */
+    /* Guard against exceeding the fixed-size dataSetWriterIds array (32 entries).
+     * The sendNetworkMessage path already checks this (line 886), but the offset-
+     * table computation calls generateNetworkMessage directly. Without this guard,
+     * a WriterGroup with more than 32 writers writes past the on-stack
+     * networkMessage.dataSetWriterIds[UA_NETWORKMESSAGE_MAXMESSAGECOUNT] array. */
+    if(dsmCount >= UA_NETWORKMESSAGE_MAXMESSAGECOUNT) {
+        UA_LOG_ERROR_PUBSUB(psm->logging, wg,
+                            "More DataSetMessages than allowed in "
+                            "UA_NETWORKMESSAGE_MAXMESSAGECOUNT");
+        res = UA_STATUSCODE_BADINTERNALERROR;
+        goto cleanup;
+    }
     res = generateNetworkMessage(wg->linkedConnection, wg, dsmStore, dsWriterIds,
                                  (UA_Byte) dsmCount, &wg->config.messageSettings,
                                  &wg->config.transportSettings, &networkMessage);

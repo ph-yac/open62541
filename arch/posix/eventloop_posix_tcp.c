@@ -283,9 +283,9 @@ TCP_connectionSocketCallback(UA_ConnectionManager *cm, TCP_FD *conn,
 
     /* Receive has failed */
     if(ret <= 0) {
-        if(UA_ERRNO == UA_INTERRUPTED ||
-           UA_ERRNO == UA_WOULDBLOCK ||
-           UA_ERRNO == UA_AGAIN)
+        if(ret < 0 && (UA_ERRNO == UA_INTERRUPTED ||
+                        UA_ERRNO == UA_WOULDBLOCK ||
+                        UA_ERRNO == UA_AGAIN))
             return; /* Temporary error on an non-blocking socket */
 
         /* Orderly shutdown of the socket */
@@ -928,8 +928,8 @@ TCP_openPassiveConnection(UA_POSIXConnectionManager *pcm, const UA_KeyValueMap *
         char hostname[512];
         if(hostStrings[i].length >= sizeof(hostname))
             continue;
-        memcpy(hostname, hostStrings[i].data, hostStrings->length);
-        hostname[hostStrings->length] = '\0';
+        memcpy(hostname, hostStrings[i].data, hostStrings[i].length);
+        hostname[hostStrings[i].length] = '\0';
         if(TCP_registerListenSockets(pcm, hostname, *port, application,
                                      context, connectionCallback, validate, reuseaddr) == UA_STATUSCODE_GOOD)
             retval = UA_STATUSCODE_GOOD;

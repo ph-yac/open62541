@@ -548,8 +548,9 @@ UA_KeyValueMap_clear(UA_KeyValueMap *map) {
         return;
     if(map->mapSize > 0) {
         UA_Array_delete(map->map, map->mapSize, &UA_TYPES[UA_TYPES_KEYVALUEPAIR]);
-        map->mapSize = 0;
     }
+    map->map = NULL;
+    map->mapSize = 0;
 }
 
 void
@@ -955,7 +956,8 @@ UA_String_escapeAppend(UA_String *s, const UA_String s2, UA_Escaping esc) {
     /* Allocate memory for the additional escaped string */
     size_t escapedLength = UA_String_escapedSize(s2, esc);
     UA_Byte *buf = (UA_Byte*)
-        UA_realloc(s->data, s->length + s2.length + escapedLength);
+        UA_realloc((void*)((uintptr_t)s->data & ~(uintptr_t)UA_EMPTY_ARRAY_SENTINEL),
+                   s->length + s2.length + escapedLength);
     if(!buf)
         return UA_STATUSCODE_BADOUTOFMEMORY;
 
@@ -1275,25 +1277,25 @@ UA_TrustListDataType_contains(const UA_TrustListDataType *trustList,
     if(!trustList || !certificate)
         return false;
 
-    if(specifiedList == UA_TRUSTLISTMASKS_TRUSTEDCERTIFICATES) {
+    if(specifiedList & UA_TRUSTLISTMASKS_TRUSTEDCERTIFICATES) {
         for(size_t i = 0; i < trustList->trustedCertificatesSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->trustedCertificates[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_TRUSTEDCRLS) {
+    if(specifiedList & UA_TRUSTLISTMASKS_TRUSTEDCRLS) {
         for(size_t i = 0; i < trustList->trustedCrlsSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->trustedCrls[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_ISSUERCERTIFICATES) {
+    if(specifiedList & UA_TRUSTLISTMASKS_ISSUERCERTIFICATES) {
         for(size_t i = 0; i < trustList->issuerCertificatesSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->issuerCertificates[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_ISSUERCRLS) {
+    if(specifiedList & UA_TRUSTLISTMASKS_ISSUERCRLS) {
         for(size_t i = 0; i < trustList->issuerCrlsSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->issuerCrls[i]))
                 return true;

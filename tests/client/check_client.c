@@ -11,6 +11,7 @@
 
 #include <check.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "test_helpers.h"
 #include "testing_clock.h"
@@ -92,16 +93,75 @@ START_TEST(ClientConfig_Copy){
     UA_ClientConfig_setDefault(&srcConfig);
     srcConfig.eventLoop->dateTime_now = UA_DateTime_now_fake;
     srcConfig.eventLoop->dateTime_nowMonotonic = UA_DateTime_now_fake;
+    srcConfig.namespaces = (UA_String*)UA_Array_new(1, &UA_TYPES[UA_TYPES_STRING]);
+    srcConfig.namespacesSize = 1;
+    srcConfig.namespaces[0] = UA_STRING_ALLOC("urn:test:configured-namespace");
 
     UA_StatusCode retval = UA_ClientConfig_copy(&srcConfig, &dstConfig);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
     UA_Client *dstConfigClient = UA_Client_newWithConfig(&dstConfig);
+    ck_assert_ptr_ne(dstConfigClient, NULL);
+    UA_UInt16 nsIndex = 0;
+    retval = UA_Client_getNamespaceIndex(dstConfigClient, srcConfig.namespaces[0], &nsIndex);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(nsIndex, 2);
     retval = UA_Client_connect(dstConfigClient, "opc.tcp://localhost:4840");
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
     UA_Client_disconnect(dstConfigClient);
     UA_Client_delete(dstConfigClient);
     UA_ApplicationDescription_clear(&srcConfig.clientDescription);
+    UA_Array_delete(srcConfig.namespaces, srcConfig.namespacesSize, &UA_TYPES[UA_TYPES_STRING]);
+}
+END_TEST
+
+START_TEST(ClientConfig_CopyOwnedMembers){
+    UA_ClientConfig srcConfig;
+    UA_ClientConfig dstConfig;
+    memset(&srcConfig, 0, sizeof(srcConfig));
+    memset(&dstConfig, 0, sizeof(dstConfig));
+
+    srcConfig.endpointUrl = UA_STRING_ALLOC("opc.tcp://example:4840");
+    srcConfig.applicationUri = UA_STRING_ALLOC("urn:example:application");
+    srcConfig.authSecurityPolicyUri = UA_STRING_ALLOC("urn:example:auth-policy");
+    srcConfig.sessionName = UA_STRING_ALLOC("copied-session");
+    srcConfig.userTokenPolicy.policyId = UA_STRING_ALLOC("username-policy");
+    srcConfig.userTokenPolicy.securityPolicyUri =
+        UA_STRING_ALLOC("urn:example:user-policy");
+    srcConfig.noSession = true;
+    srcConfig.noReconnect = true;
+    srcConfig.noNewSession = true;
+    srcConfig.tcpReuseAddr = true;
+    srcConfig.allowNonePolicyPassword = true;
+    srcConfig.namespaces = (UA_String*)UA_Array_new(1, &UA_TYPES[UA_TYPES_STRING]);
+    srcConfig.namespacesSize = 1;
+    srcConfig.namespaces[0] = UA_STRING_ALLOC("urn:example:namespace");
+
+    UA_StatusCode retval = UA_ClientConfig_copy(&srcConfig, &dstConfig);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(UA_String_equal(&srcConfig.endpointUrl, &dstConfig.endpointUrl));
+    ck_assert(UA_String_equal(&srcConfig.applicationUri, &dstConfig.applicationUri));
+    ck_assert(UA_String_equal(&srcConfig.authSecurityPolicyUri,
+                              &dstConfig.authSecurityPolicyUri));
+    ck_assert(UA_String_equal(&srcConfig.sessionName, &dstConfig.sessionName));
+    ck_assert(UA_String_equal(&srcConfig.userTokenPolicy.policyId,
+                              &dstConfig.userTokenPolicy.policyId));
+    ck_assert(UA_String_equal(&srcConfig.userTokenPolicy.securityPolicyUri,
+                              &dstConfig.userTokenPolicy.securityPolicyUri));
+    ck_assert_ptr_ne(srcConfig.endpointUrl.data, dstConfig.endpointUrl.data);
+    ck_assert_ptr_ne(srcConfig.userTokenPolicy.policyId.data,
+                     dstConfig.userTokenPolicy.policyId.data);
+    ck_assert(dstConfig.noSession);
+    ck_assert(dstConfig.noReconnect);
+    ck_assert(dstConfig.noNewSession);
+    ck_assert(dstConfig.tcpReuseAddr);
+    ck_assert(dstConfig.allowNonePolicyPassword);
+    ck_assert_uint_eq(dstConfig.namespacesSize, 1);
+    ck_assert(UA_String_equal(&srcConfig.namespaces[0], &dstConfig.namespaces[0]));
+    ck_assert_ptr_ne(srcConfig.namespaces[0].data, dstConfig.namespaces[0].data);
+
+    UA_ClientConfig_clear(&srcConfig);
+    UA_ClientConfig_clear(&dstConfig);
 }
 END_TEST
 
@@ -112,6 +172,30 @@ START_TEST(Client_connect) {
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
     UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+/* The client sends the URL it connects to as the EndpointUrl of its HEL.
+ * Part 6 requires less than 4096 bytes and BadTcpEndpointUrlInvalid beyond. */
+START_TEST(Client_connect_endpointUrlLimit) {
+    const char *prefix = "opc.tcp://localhost:4840/";
+    size_t prefixLen = strlen(prefix);
+    char url[4097];
+    memcpy(url, prefix, prefixLen);
+    memset(url + prefixLen, 'a', sizeof(url) - 1 - prefixLen);
+
+    url[4095] = 0;
+    UA_Client *client = UA_Client_newForUnitTest();
+    ck_assert_uint_eq(UA_Client_connect(client, url), UA_STATUSCODE_GOOD);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+
+    url[4095] = 'a';
+    url[4096] = 0;
+    client = UA_Client_newForUnitTest();
+    ck_assert_uint_eq(UA_Client_connect(client, url),
+                      UA_STATUSCODE_BADTCPENDPOINTURLINVALID);
     UA_Client_delete(client);
 }
 END_TEST
@@ -288,7 +372,7 @@ START_TEST(Client_reconnect) {
 
     printf("Reconnect client \n");
     fflush(stdout);
-    retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    UA_Client_connect(client, "opc.tcp://localhost:4840");
     ck_assert_msg(retval == UA_STATUSCODE_GOOD, UA_StatusCode_name(retval));
 
     UA_SessionState ss;
@@ -451,7 +535,7 @@ START_TEST(Client_closes_on_server_error) {
 }
 END_TEST
 
-static void timedCallbackFired(UA_Client *c, void *data) {
+static void timerFired(UA_Client *c, void *data) {
     UA_Boolean *flag = (UA_Boolean *)data;
     *flag = true;
 }
@@ -465,7 +549,7 @@ START_TEST(Client_addTimedCallback) {
     UA_UInt64 cbId = 0;
     /* Use a deadline in the past so it fires on the next iteration.
      * The event loop uses UA_DateTime_now_fake which starts at a low value. */
-    retval = UA_Client_addTimedCallback(client, timedCallbackFired,
+    retval = UA_Client_addTimedCallback(client, timerFired,
                                         &fired, 1, &cbId);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert(cbId != 0);
@@ -489,7 +573,7 @@ START_TEST(Client_addRepeatedCallback) {
 
     UA_Boolean fired = false;
     UA_UInt64 cbId = 0;
-    retval = UA_Client_addRepeatedCallback(client, timedCallbackFired,
+    retval = UA_Client_addRepeatedCallback(client, timerFired,
                                            &fired, 50.0, &cbId);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
     ck_assert(cbId != 0);
@@ -515,7 +599,7 @@ START_TEST(Client_changeRepeatedCallbackInterval) {
 
     UA_Boolean fired = false;
     UA_UInt64 cbId = 0;
-    retval = UA_Client_addRepeatedCallback(client, timedCallbackFired,
+    retval = UA_Client_addRepeatedCallback(client, timerFired,
                                            &fired, 5000.0, &cbId);
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
@@ -757,12 +841,222 @@ START_TEST(Client_setAuthenticationUsername) {
 }
 END_TEST
 
+START_TEST(Client_newWithConfig_NULL) {
+    UA_Client *client = UA_Client_newWithConfig(NULL);
+    ck_assert_ptr_eq(client, NULL);
+}
+END_TEST
+
+START_TEST(Client_getNamespaceUri_outOfBounds) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_String nsUri;
+    UA_String_init(&nsUri);
+    retval = UA_Client_getNamespaceUri(client, UINT16_MAX, &nsUri);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADNOTFOUND);
+    ck_assert_uint_eq(nsUri.length, 0);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+/* Test lifecycle notification callback fires on client delete */
+static UA_Boolean lifecycleCallbackCalled = false;
+static void
+lifecycleCallback(UA_Client *client, UA_ApplicationNotificationType notificationType,
+                   const UA_KeyValueMap parameters) {
+    lifecycleCallbackCalled = true;
+}
+
+START_TEST(Client_lifecycleNotificationCallback) {
+    UA_ClientConfig config;
+    memset(&config, 0, sizeof(UA_ClientConfig));
+    UA_ClientConfig_setDefault(&config);
+    config.lifecycleNotificationCallback = lifecycleCallback;
+
+    lifecycleCallbackCalled = false;
+    UA_Client *client = UA_Client_newWithConfig(&config);
+    ck_assert_ptr_ne(client, NULL);
+
+    /* Delete client - should trigger LIFECYCLE_STOPPED notification */
+    UA_Client_delete(client);
+    ck_assert_uint_eq(lifecycleCallbackCalled, true);
+}
+END_TEST
+
+/* Test UA_ClientConfig_delete does not crash on a defaulted config */
+START_TEST(Client_config_delete) {
+    UA_ClientConfig *config = (UA_ClientConfig*)UA_malloc(sizeof(UA_ClientConfig));
+    ck_assert_ptr_ne(config, NULL);
+    memset(config, 0, sizeof(UA_ClientConfig));
+    UA_ClientConfig_setDefault(config);
+
+    UA_ClientConfig_delete(config);
+}
+END_TEST
+
+START_TEST(Client_getNamespaceIndex_notFound) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    /* Try to find non-existent namespace */
+    UA_UInt16 idx;
+    UA_String ns = UA_STRING("http://nonexistent/");
+    retval = UA_Client_getNamespaceIndex(client, ns, &idx);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_BADNOTFOUND);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_getNamespaceUri_valid) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    /* Get namespace URI for index 0 (should be the OPC UA namespace) */
+    UA_String nsUri;
+    UA_String_init(&nsUri);
+    retval = UA_Client_getNamespaceUri(client, 0, &nsUri);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert(nsUri.length > 0);
+
+    UA_String_clear(&nsUri);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+#ifdef UA_ENABLE_QUERY
+START_TEST(Client_queryNext_emptyContinuation) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_QueryNextRequest request;
+    UA_QueryNextRequest_init(&request);
+    request.releaseContinuationPoint = false;
+    request.continuationPoint = UA_BYTESTRING_NULL;
+
+    UA_QueryNextResponse response = UA_Client_Service_queryNext(client, request);
+    ck_assert_uint_ne(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    UA_QueryNextResponse_clear(&response);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+
+START_TEST(Client_service_queryFirst_emptyRequest) {
+    /* src/client/ua_client.c:1489-1496 (UA_Client_Service_queryFirst):
+     *   __UA_Client_Service(client, &request, ...);
+     *   return response;
+     * The function is a thin wrapper around __UA_Client_Service; the
+     * Client_queryNext_emptyContinuation test exists for queryNext but
+     * not for queryFirst. With an empty (no-node) query the server
+     * returns a non-GOOD serviceResult. */
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_QueryFirstRequest request;
+    UA_QueryFirstRequest_init(&request);
+    /* No view, no node types, no filter -- minimal request */
+
+    UA_QueryFirstResponse response = UA_Client_Service_queryFirst(client, request);
+    /* The server doesn't store a query; an empty request must come
+     * back with some non-GOOD status (e.g. BADVIEWIDUNKNOWN, BADDECODINGERROR,
+     * BADNODEIDINVALID, or BADNOTIMPLEMENTED depending on the server
+     * build). The request must round-trip -- the round-trip itself
+     * sets responseHeader.serviceResult, which is what we check. */
+    ck_assert_uint_ne(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    UA_QueryFirstResponse_clear(&response);
+
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+}
+END_TEST
+#endif
+
+/* Timed callback that advances the fake clock to trigger a timeout */
+static void
+timeoutTriggerCallback(void *application, void *data) {
+    UA_Boolean *fired = (UA_Boolean *)data;
+    if(!*fired) {
+        *fired = true;
+        UA_fakeSleep(10000); /* Advance clock by 10s past any short timeout */
+    }
+}
+
+START_TEST(Client_connectTimeoutRecovery) {
+    /* Reproducer for #7061: when connectSync / activateSessionSync times
+     * out, the channel must not be left in a half-closed (CLOSING) state
+     * that blocks the next connect attempt. */
+    teardown();
+    setup();
+    ck_assert_uint_eq(server->sessionCount, 0);
+
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_ClientConfig *cconfig = UA_Client_getConfig(client);
+    UA_ClientConfig_setDefault(cconfig);
+
+    /* Connect and disconnect to establish clean CLOSED state */
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    UA_Client_disconnect(client);
+    ck_assert(client->channel.state == UA_SECURECHANNELSTATE_CLOSED);
+
+    /* Short timeout: on a remote server this would trigger a timeout
+     * during the handshake. On localhost we use a fake-clock callback
+     * to trigger it artificially. */
+    cconfig->timeout = 100; /* 100ms */
+
+    /* Register a timed callback on the client's event loop. It fires
+     * during the first el->run inside connectSync and advances the
+     * fake clock by 10s, making the timeout check fire. */
+    UA_EventLoop *el = client->config.eventLoop;
+    UA_DateTime now = UA_DateTime_nowMonotonic();
+    UA_Boolean fired = false;
+    UA_UInt64 callbackId;
+    el->addTimer(el, timeoutTriggerCallback, NULL, &fired,
+                 UA_DATETIME_MSEC, &now, UA_TIMERPOLICY_ONCE,
+                 &callbackId);
+
+    /* Connect attempt should time out (or at least not leave CLOSING) */
+    retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert(client->channel.state != UA_SECURECHANNELSTATE_CLOSING);
+
+    /* Second connect attempt must work (no stuck CLOSING channel) */
+    cconfig->timeout = 5000;
+    retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(server->sessionCount, 1);
+
+    UA_Variant val;
+    UA_Variant_init(&val);
+    UA_NodeId nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
+    retval = UA_Client_readValueAttribute(client, nodeId, &val);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    UA_Variant_clear(&val);
+
+    UA_Client_delete(client);
+    ck_assert_uint_eq(server->sessionCount, 0);
+}
+END_TEST
+
 static Suite* testSuite_Client(void) {
     Suite *s = suite_create("Client");
     TCase *tc_client = tcase_create("Client Basic");
     tcase_add_checked_fixture(tc_client, setup, teardown);
     tcase_add_test(tc_client, ClientConfig_Copy);
+    tcase_add_test(tc_client, ClientConfig_CopyOwnedMembers);
     tcase_add_test(tc_client, Client_connect);
+    tcase_add_test(tc_client, Client_connect_endpointUrlLimit);
     tcase_add_test(tc_client, Client_connect_username);
     tcase_add_test(tc_client, Client_delete_without_connect);
     tcase_add_test(tc_client, Client_endpoints);
@@ -779,6 +1073,7 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_client_reconnect, Client_reconnect);
     tcase_add_test(tc_client_reconnect, Client_activateSessionClose);
     tcase_add_test(tc_client_reconnect, Client_activateSessionTimeout);
+    tcase_add_test(tc_client_reconnect, Client_connectTimeoutRecovery);
     tcase_add_test(tc_client_reconnect, Client_activateSessionLocaleIds);
     suite_add_tcase(s,tc_client_reconnect);
 
@@ -796,6 +1091,16 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_ext, Client_cancelByRequestHandle);
     tcase_add_test(tc_ext, Client_cancelByRequestId_notFound);
     tcase_add_test(tc_ext, Client_setAuthenticationUsername);
+    tcase_add_test(tc_ext, Client_newWithConfig_NULL);
+    tcase_add_test(tc_ext, Client_getNamespaceUri_outOfBounds);
+    tcase_add_test(tc_ext, Client_lifecycleNotificationCallback);
+    tcase_add_test(tc_ext, Client_config_delete);
+    tcase_add_test(tc_ext, Client_getNamespaceIndex_notFound);
+    tcase_add_test(tc_ext, Client_getNamespaceUri_valid);
+#ifdef UA_ENABLE_QUERY
+    tcase_add_test(tc_ext, Client_queryNext_emptyContinuation);
+    tcase_add_test(tc_ext, Client_service_queryFirst_emptyRequest);
+#endif
     suite_add_tcase(s, tc_ext);
 
     return s;

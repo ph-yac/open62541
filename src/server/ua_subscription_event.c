@@ -486,22 +486,28 @@ implicitCastTargetType(const UA_DataType *t1, const UA_DataType *t2) {
  * - Converting a value that is outside the range of the target type causes a
  *   conversion error. */
 
-#define UA_CAST_SIGNED(t, T)                                         \
-    if(i < (UA_Int64)T##_MIN || i > (UA_Int64)T##_MAX)               \
-        return;                                                      \
-    *(t*)data = (t)i;                                                \
+#define UA_CAST_SIGNED(t, T)                                           \
+    if(i < (UA_Int64)T##_MIN || i > (UA_Int64)T##_MAX) {               \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)i;                                                  \
     do { } while(0)
 
-#define UA_CAST_UNSIGNED(t, T)                                       \
-    if(u > T##_MAX)                                                  \
-        return;                                                      \
-    *(t*)data = (t)u;                                                \
+#define UA_CAST_UNSIGNED(t, T)                                         \
+    if(u > T##_MAX) {                                                  \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)u;                                                  \
     do { } while(0)
 
-#define UA_CAST_FLOAT(t, T)                                          \
-    if(f + 0.5 < (UA_Double)T##_MIN || f + 0.5 > (UA_Double)T##_MAX) \
-        return;                                                      \
-    *(t*)data = (t)(f + 0.5);                                        \
+#define UA_CAST_FLOAT(t, T)                                            \
+    if(f + 0.5 < (UA_Double)T##_MIN || f + 0.5 > (UA_Double)T##_MAX) { \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)(f + 0.5);                                          \
     do { } while(0)
 
 /* We can cast between any numerical type. So this can be reused for explicit casting. */
@@ -1085,7 +1091,7 @@ inListOperator(UA_FilterEvalContext *ctx, size_t index) {
         res = resolveOperand(ctx, &elm->filterOperands[i], op1);
         if(res != UA_STATUSCODE_GOOD)
             continue;
-        if(op0->type == op1->type && UA_equal(op0->data, op1->data, op0->type))
+        if(UA_Variant_equal(op0, op1))
             found = true;
         UA_Variant_clear(op1);
     }
@@ -1145,6 +1151,13 @@ evaluateWhereClause(UA_FilterEvalContext *ctx) {
     /* An empty filter always succeeds */
     if(ctx->filter.whereClause.elementsSize == 0)
         return UA_STATUSCODE_GOOD;
+
+    /* Information-model filters may bypass creation-time validation. */
+    for(size_t i = 0; i < ctx->filter.whereClause.elementsSize; i++) {
+        if((UA_UInt32)ctx->filter.whereClause.elements[i].filterOperator >
+           UA_FILTEROPERATOR_BITWISEOR)
+            return UA_STATUSCODE_BADEVENTFILTERINVALID;
+    }
 
     /* Pacify some compilers by initializing the first result */
     UA_assert(ctx->top == 0);
@@ -1665,8 +1678,9 @@ createEvent(UA_Server *server, const UA_EventDescription *ed,
         }
 
         /* Iterate over all MonitoredItems registered in the node  */
-        for(UA_MonitoredItem *mon = node->head.monitoredItems;
-            mon != NULL; mon = mon->sampling.nodeListNext) {
+        UA_MonitoredItem *mon;
+        LIST_FOREACH(mon, (const UA_MonitoredItemList*)&node->head.monitoredItems,
+                     sampling.nodeListEntry) {
             /* Is this an Event-MonitoredItem? */
             if(mon->itemToMonitor.attributeId != UA_ATTRIBUTEID_EVENTNOTIFIER)
                 continue;
@@ -1695,10 +1709,11 @@ createEvent(UA_Server *server, const UA_EventDescription *ed,
             }
             ctx.filter = *(UA_EventFilter*)mon->parameters.filter.content.decoded.data;
 
-            /* Select the session used to resolve SimpleAttributeOperands. If
-             * the subscription is not bound to a session, use the AdminSession.
-             * TODO: Preserve the access rights of the last connected session? */
-            ctx.session = (sub->session) ? sub->session : &server->adminSession;
+            /* Do not evaluate event fields for detached subscriptions.
+             * Using adminSession would bypass per-session access control. */
+            if(!sub->session)
+                continue;
+            ctx.session = sub->session;
 
             /* Evaluate the where-clause and create a notification */
             res = UA_MonitoredItem_addEvent(mon, &ctx);

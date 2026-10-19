@@ -21,9 +21,11 @@ _UA_BEGIN_DECLS
 struct ContinuationPoint;
 typedef struct ContinuationPoint ContinuationPoint;
 
-/* Returns the next entry in the linked list */
-ContinuationPoint *
-ContinuationPoint_clear(ContinuationPoint *cp);
+typedef TAILQ_HEAD(ContinuationPointQueue, ContinuationPoint)
+    ContinuationPointQueue;
+
+void
+ContinuationPointQueue_clear(ContinuationPointQueue *queue);
 
 struct UA_Subscription;
 typedef struct UA_Subscription UA_Subscription;
@@ -59,11 +61,17 @@ struct UA_Session {
 
     UA_ByteString serverNonce;
 
+    /* The clientNonce from the CreateSession request. Retained for the
+     * v1.05.07 channel-bound ActivateSession ClientSignature verification
+     * (secureChannelEnhancements). */
+    UA_ByteString clientNonce;
+
     UA_ApplicationDescription clientDescription;
     UA_ByteString clientCertificate; /* Must be the same as for the
                                       * SecureChannel. If the SecureChannel is
                                       * #None, verify and store here. */
     UA_String clientUserIdOfSession;
+    UA_UserTokenType userTokenType;
     UA_Double timeout; /* in ms */
     UA_DateTime validTill;
 
@@ -73,8 +81,8 @@ struct UA_Session {
     UA_UInt32 maxRequestMessageSize;
     UA_UInt32 maxResponseMessageSize;
 
-    UA_UInt16         availableContinuationPoints;
-    ContinuationPoint *continuationPoints;
+    size_t continuationPointsSize;
+    ContinuationPointQueue continuationPoints;
 
     /* Localization information */
     size_t localeIdsSize;

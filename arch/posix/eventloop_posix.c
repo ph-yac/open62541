@@ -464,7 +464,7 @@ UA_EventLoopPOSIX_DateTime_now(UA_EventLoop *el) {
 #if defined(UA_ARCHITECTURE_POSIX)
     UA_EventLoopPOSIX *pel = (UA_EventLoopPOSIX*)el;
     struct timespec ts;
-    int res = clock_gettime(pel->clockSource, &ts);
+    int res = clock_gettime((clockid_t)pel->clockSource, &ts);
     if(UA_UNLIKELY(res != 0))
         return 0;
     return (ts.tv_sec * UA_DATETIME_SEC) + (ts.tv_nsec / 100) + UA_DATETIME_UNIX_EPOCH;
@@ -478,7 +478,7 @@ UA_EventLoopPOSIX_DateTime_nowMonotonic(UA_EventLoop *el) {
 #if defined(UA_ARCHITECTURE_POSIX)
     UA_EventLoopPOSIX *pel = (UA_EventLoopPOSIX*)el;
     struct timespec ts;
-    int res = clock_gettime(pel->clockSourceMonotonic, &ts);
+    int res = clock_gettime((clockid_t)pel->clockSourceMonotonic, &ts);
     if(UA_UNLIKELY(res != 0))
         return 0;
     /* Also add the unix epoch for the monotonic clock. So we get a "normal"
@@ -624,10 +624,9 @@ UA_EventLoopPOSIX_allocNetworkBuffer(UA_ConnectionManager *cm,
                                      UA_ByteString *buf,
                                      size_t bufSize) {
     UA_POSIXConnectionManager *pcm = (UA_POSIXConnectionManager*)cm;
-    if(pcm->txBuffer.length == 0)
-        return UA_ByteString_allocBuffer(buf, bufSize);
+    /* Reuse the static tx buffer; fall back to allocation for larger messages. */
     if(pcm->txBuffer.length < bufSize)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
+        return UA_ByteString_allocBuffer(buf, bufSize);
     *buf = pcm->txBuffer;
     buf->length = bufSize;
     return UA_STATUSCODE_GOOD;
@@ -646,27 +645,19 @@ UA_EventLoopPOSIX_freeNetworkBuffer(UA_ConnectionManager *cm,
 
 UA_StatusCode
 UA_EventLoopPOSIX_allocateStaticBuffers(UA_POSIXConnectionManager *pcm) {
-    UA_StatusCode res = UA_STATUSCODE_GOOD;
-    UA_UInt32 rxBufSize = 2u << 16; /* The default is 64kb */
-    const UA_UInt32 *configRxBufSize = (const UA_UInt32 *)
-        UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
-                                 UA_QUALIFIEDNAME(0, "recv-bufsize"),
-                                 &UA_TYPES[UA_TYPES_UINT32]);
-    if(configRxBufSize)
-        rxBufSize = *configRxBufSize;
-    if(pcm->rxBuffer.length != rxBufSize) {
-        UA_ByteString_clear(&pcm->rxBuffer);
-        res = UA_ByteString_allocBuffer(&pcm->rxBuffer, rxBufSize);
-    }
+    UA_StatusCode res =
+        UA_EventLoopCommon_allocStaticBuffer(&pcm->cm.eventSource.params,
+                                             UA_QUALIFIEDNAME(0, "recv-bufsize"),
+                                             1u << 16, /* The default is 64 kb */
+                                             &pcm->rxBuffer);
 
-    const UA_UInt32 *txBufSize = (const UA_UInt32 *)
-        UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
-                                 UA_QUALIFIEDNAME(0, "send-bufsize"),
-                                 &UA_TYPES[UA_TYPES_UINT32]);
-    if(txBufSize && pcm->txBuffer.length != *txBufSize) {
-        UA_ByteString_clear(&pcm->txBuffer);
-        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, *txBufSize);
-    }
+    /* Default the tx buffer to the rx size so a dedicated static send buffer
+     * always exists. This avoids a malloc/free on every send without reusing
+     * the rx buffer (which may still hold unprocessed received data). */
+    res |= UA_EventLoopCommon_allocStaticBuffer(&pcm->cm.eventSource.params,
+                                                UA_QUALIFIEDNAME(0, "send-bufsize"),
+                                                (UA_UInt32)pcm->rxBuffer.length,
+                                                &pcm->txBuffer);
     return res;
 }
 
@@ -1058,7 +1049,7 @@ int UA_EventLoopPOSIX_pipe(SOCKET fds[2]) {
 
     struct sockaddr_storage addr;
     memset(&addr, 0, sizeof(addr));
-    int len = sizeof(addr);
+    socklen_t len = sizeof(addr);
     getsockname(lst, (struct sockaddr*)&addr, &len);
 
     fds[0] = socket(AF_INET, SOCK_STREAM, 0);

@@ -27,6 +27,17 @@ static const UA_NodeId subDiagArray = {0, UA_NODEIDTYPE_NUMERIC, {UA_NS0ID_SERVE
 /* Subscription Diagnostics */
 /****************************/
 
+static void *
+countDisabledMonitoredItemsVisitor(void *context, UA_MonitoredItem *mon) {
+    UA_SubscriptionDiagnosticsDataType *diag =
+        (UA_SubscriptionDiagnosticsDataType*)context;
+
+    if(mon->monitoringMode == UA_MONITORINGMODE_DISABLED)
+        diag->disabledMonitoredItemCount++;
+
+    return NULL;
+}
+
 static void
 fillSubscriptionDiagnostics(UA_Subscription *sub,
                             UA_SubscriptionDiagnosticsDataType *diag) {
@@ -63,11 +74,8 @@ fillSubscriptionDiagnostics(UA_Subscription *sub,
     diag->eventQueueOverflowCount = sub->eventQueueOverflowCount;
 
     /* Count the disabled MonitoredItems */
-    UA_MonitoredItem *mon;
-    LIST_FOREACH(mon, &sub->monitoredItems, listEntry) {
-        if(mon->monitoringMode == UA_MONITORINGMODE_DISABLED)
-            diag->disabledMonitoredItemCount++;
-    }
+    ZIP_ITER(UA_MonitoredItemIdTree, &sub->monitoredItemsById,
+             countDisabledMonitoredItemsVisitor, diag);
 }
 
 /* The node context points to the subscription */
@@ -94,6 +102,11 @@ readSubscriptionDiagnostics(UA_Server *server,
     fillSubscriptionDiagnostics(sub, &sddt);
 
     char memberName[128];
+    if(bn.name.length >= sizeof(memberName)) {
+        UA_SubscriptionDiagnosticsDataType_clear(&sddt);
+        UA_QualifiedName_clear(&bn);
+        return UA_STATUSCODE_BADNOTIMPLEMENTED;
+    }
     memcpy(memberName, bn.name.data, bn.name.length);
     memberName[bn.name.length] = 0;
 
@@ -406,6 +419,10 @@ readSessionDiagnostics(UA_Server *server,
     } else {
         /* Try to find the member in SessionDiagnosticsDataType and
          * SessionSecurityDiagnosticsDataType */
+        if(bn.name.length >= sizeof(memberName)) {
+            res = UA_STATUSCODE_BADNOTIMPLEMENTED;
+            goto cleanup;
+        }
         memcpy(memberName, bn.name.data, bn.name.length);
         memberName[bn.name.length] = 0;
         found = UA_DataType_getStructMember(&UA_TYPES[UA_TYPES_SESSIONDIAGNOSTICSDATATYPE],

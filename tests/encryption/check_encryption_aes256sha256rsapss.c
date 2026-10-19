@@ -10,6 +10,7 @@
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/securitypolicy.h>
+#include <open62541/plugin/securitypolicy_default.h>
 #include <open62541/plugin/certificategroup_default.h>
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
@@ -301,6 +302,84 @@ START_TEST(encryption_connect_pem) {
 }
 END_TEST
 
+#if defined(UA_ENABLE_ENCRYPTION_MBEDTLS)
+START_TEST(securitypolicy_rejects_malformed_signature_length) {
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    UA_String policyUri = UA_STRING(
+        "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
+    UA_SecurityPolicy *sp = NULL;
+    for(size_t i = 0; i < config->securityPoliciesSize; i++) {
+        if(UA_String_equal(&config->securityPolicies[i].policyUri, &policyUri)) {
+            sp = &config->securityPolicies[i];
+            break;
+        }
+    }
+    ck_assert_ptr_ne(sp, NULL);
+
+    UA_ByteString certificate = {CERT_DER_LENGTH, CERT_DER_DATA};
+    void *channelContext = NULL;
+    UA_StatusCode retval =
+        sp->newChannelContext(sp, &certificate, &channelContext);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_ByteString message = UA_BYTESTRING("signature length regression");
+    size_t expectedSize = sp->asymSignatureAlgorithm.
+        getRemoteSignatureSize(sp, channelContext);
+    UA_ByteString signature = UA_BYTESTRING_NULL;
+    retval = UA_ByteString_allocBuffer(&signature, expectedSize + 1);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    signature.length = expectedSize;
+    retval = sp->asymSignatureAlgorithm.sign(sp, channelContext,
+                                             &message, &signature);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    retval = sp->asymSignatureAlgorithm.verify(sp, channelContext,
+                                               &message, &signature);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    const size_t invalidSizes[] = {0, 1, expectedSize - 1, expectedSize + 1};
+    for(size_t i = 0; i < sizeof(invalidSizes) / sizeof(invalidSizes[0]); i++) {
+        signature.length = invalidSizes[i];
+        retval = sp->asymSignatureAlgorithm.verify(sp, channelContext,
+                                                   &message, &signature);
+        ck_assert_uint_eq(retval, UA_STATUSCODE_BADSECURITYCHECKSFAILED);
+    }
+
+    signature.length = expectedSize + 1;
+    UA_ByteString_clear(&signature);
+    sp->deleteChannelContext(sp, channelContext);
+}
+END_TEST
+#endif /* defined(UA_ENABLE_ENCRYPTION_MBEDTLS) */
+
+#if defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_LIBRESSL)
+START_TEST(securitypolicy_aes256sha256rsapss_null_cert_no_underflow) {
+    UA_ByteString certificate = {CERT_DER_LENGTH, CERT_DER_DATA};
+    UA_ByteString privateKey  = {KEY_DER_LENGTH,  KEY_DER_DATA};
+
+    UA_Client *client = UA_Client_newForUnitTest();
+    ck_assert(client != NULL);
+    UA_ClientConfig *cc = UA_Client_getConfig(client);
+
+    UA_SecurityPolicy policy;
+    memset(&policy, 0, sizeof(policy));
+    UA_StatusCode retval = UA_SecurityPolicy_Aes256Sha256RsaPss(&policy, certificate,
+                                                                privateKey, cc->logging);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    unsigned char fakeCtx[256];
+    memset(fakeCtx, 0, sizeof(fakeCtx));
+
+    size_t result = policy.asymEncryptionAlgorithm
+                        .getRemotePlainTextBlockSize(&policy, fakeCtx);
+
+    ck_assert_uint_eq(result, 0);
+
+    policy.clear(&policy);
+    UA_Client_delete(client);
+}
+END_TEST
+#endif /* defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_LIBRESSL) */
+
 static Suite* testSuite_encryption(void) {
     Suite *s = suite_create("Encryption");
     TCase *tc_encryption = tcase_create("Encryption Aes256Sha256RsaPss security policy");
@@ -308,8 +387,17 @@ static Suite* testSuite_encryption(void) {
 #ifdef UA_ENABLE_ENCRYPTION
     tcase_add_test(tc_encryption, encryption_connect);
     tcase_add_test(tc_encryption, encryption_connect_pem);
+# if defined(UA_ENABLE_ENCRYPTION_MBEDTLS)
+    tcase_add_test(tc_encryption, securitypolicy_rejects_malformed_signature_length);
+# endif
 #endif /* UA_ENABLE_ENCRYPTION */
     suite_add_tcase(s,tc_encryption);
+
+#if defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_LIBRESSL)
+    TCase *tc_unit = tcase_create("Security policy unit tests (OpenSSL/LibreSSL)");
+    tcase_add_test(tc_unit, securitypolicy_aes256sha256rsapss_null_cert_no_underflow);
+    suite_add_tcase(s, tc_unit);
+#endif /* defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_LIBRESSL) */
 
 #if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32)
     TCase *tc_encryption_filestore = tcase_create("Encryption Aes256Sha256RsaPss security policy filestore");

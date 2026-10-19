@@ -177,7 +177,15 @@ setSecurityKeysAction(UA_Server *server, const UA_NodeId *sessionId, void *sessi
     if(!UA_String_equal(securityPolicyUri, &ks->policy->policyUri))
         return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
 
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    UA_StatusCode retval =
+        UA_PubSubKeyStorage_validateKeyMaterial(ks, 1, currentKey);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+    retval = UA_PubSubKeyStorage_validateKeyMaterial(
+        ks, futureKeySize, futureKeys);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+
     UA_PubSubKeyListItem *current = UA_PubSubKeyStorage_getKeyByKeyId(ks, currentKeyId);
     if(!current) {
         UA_PubSubKeyStorage_clearKeyList(ks);
@@ -257,6 +265,8 @@ getSecurityKeysAction(UA_Server *server, const UA_NodeId *sessionId, void *sessi
 
     UA_Boolean executable = false;
     UA_SecurityGroup *sg = UA_SecurityGroup_findByName(psm, *securityGroupId);
+    if(!sg || sg->keyStorage != ks)
+        return UA_STATUSCODE_BADNOTFOUND;
     void *sgNodeCtx;
     getNodeContext(server, sg->securityGroupNodeId, (void **)&sgNodeCtx);
     executable = server->config.accessControl.getUserExecutableOnObject(
@@ -321,14 +331,18 @@ getSecurityKeysAction(UA_Server *server, const UA_NodeId *sessionId, void *sessi
     /* Keys */
     UA_PubSubKeyListItem *iterator = startingItem;
     output[2].data = (UA_ByteString *)
-        UA_calloc(requestedKeyCount, startingItem->key.length);
+        UA_calloc(requestedKeyCount, sizeof(UA_ByteString));
     if(!output[2].data)
         return UA_STATUSCODE_BADOUTOFMEMORY;
 
     UA_ByteString *requestedKeys = (UA_ByteString *)output[2].data;
     UA_UInt32 retkeyCount = 0;
     for(size_t i = 0; i < requestedKeyCount; i++) {
-        UA_ByteString_copy(&iterator->key, &requestedKeys[i]);
+        retval = UA_ByteString_copy(&iterator->key, &requestedKeys[i]);
+        if(retval != UA_STATUSCODE_GOOD) {
+            requestedKeyCount = retkeyCount;
+            break;
+        }
         ++retkeyCount;
         iterator = TAILQ_NEXT(iterator, keyListEntry);
         if(!iterator) {

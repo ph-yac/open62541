@@ -261,26 +261,19 @@ Service_FindServersOnNetwork(UA_Server *server, UA_Session *session,
         return true;
     }
 
-    /* Iterate over all records and add to filtered list */
+    /* Count the matching records without placing a cache-sized temporary
+     * array on the stack. The service mutex keeps the list stable between
+     * this pass and the copy pass below. */
     UA_UInt32 filteredCount = 0;
-    UA_STACKARRAY(UA_ServerOnNetwork*, filtered, recordCount);
     UA_ServerOnNetwork *current = UA_DiscoveryManager_getServerOnNetworkList(dm);
-    if(!current) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
-        return true;
-    }
-    for(size_t i = 0; i < recordCount; i++) {
-        if(filteredCount >= recordCount)
-            break;
+    for(; current && filteredCount < recordCount;
+        current = UA_DiscoveryManager_getNextServerOnNetworkRecord(dm, current)) {
         if(current->recordId < request->startingRecordId)
             continue;
         if(!entryMatchesCapabilityFilter(request->serverCapabilityFilterSize,
-                               request->serverCapabilityFilter, current))
+                                         request->serverCapabilityFilter, current))
             continue;
-        filtered[filteredCount++] = current;
-        current = UA_DiscoveryManager_getNextServerOnNetworkRecord(dm, current);
-        if(!current)
-            break;
+        filteredCount++;
     }
 
     if(filteredCount == 0)
@@ -288,16 +281,40 @@ Service_FindServersOnNetwork(UA_Server *server, UA_Session *session,
 
     /* Allocate the array for the response */
     response->servers = (UA_ServerOnNetwork*)
-        UA_malloc(sizeof(UA_ServerOnNetwork)*filteredCount);
+        UA_Array_new(filteredCount, &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
     if(!response->servers) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
         return true;
     }
     response->serversSize = filteredCount;
 
-    /* Copy the server names */
-    for(size_t i = 0; i < filteredCount; i++) {
-        UA_ServerOnNetwork_copy(filtered[i], &response->servers[filteredCount-i-1]);
+    /* Copy the server names in the same oldest-to-newest order as before */
+    size_t pos = filteredCount;
+    current = UA_DiscoveryManager_getServerOnNetworkList(dm);
+    for(; current && pos > 0;
+        current = UA_DiscoveryManager_getNextServerOnNetworkRecord(dm, current)) {
+        if(current->recordId < request->startingRecordId)
+            continue;
+        if(!entryMatchesCapabilityFilter(request->serverCapabilityFilterSize,
+                                         request->serverCapabilityFilter, current))
+            continue;
+        UA_StatusCode retval =
+            UA_ServerOnNetwork_copy(current, &response->servers[--pos]);
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_Array_delete(response->servers, response->serversSize,
+                            &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+            response->servers = NULL;
+            response->serversSize = 0;
+            response->responseHeader.serviceResult = retval;
+            return true;
+        }
+    }
+    if(pos != 0) {
+        UA_Array_delete(response->servers, response->serversSize,
+                        &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+        response->servers = NULL;
+        response->serversSize = 0;
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
     }
     return true;
 }
@@ -312,15 +329,18 @@ getDefaultEncryptedSecurityPolicy(UA_Server *server,
     UA_SecurityPolicy *best = NULL;
     UA_Byte securityLevel = 0;
 
+    (void)type;
     for(size_t i = 0; i < server->config.securityPoliciesSize; i++) {
         UA_SecurityPolicy *sp = &server->config.securityPolicies[i];
         if(sp->policyType == UA_SECURITYPOLICYTYPE_NONE)
             continue;
-        if(sp->policyType == UA_SECURITYPOLICYTYPE_RSA &&
-           type == UA_SECURITYPOLICYTYPE_ECC)
-            continue;
-        if(sp->policyType == UA_SECURITYPOLICYTYPE_ECC &&
-           type == UA_SECURITYPOLICYTYPE_RSA)
+        /* This SecurityPolicy is used to secure a UserIdentityToken on top of a
+         * #None SecureChannel (the only situation this function is called for).
+         * ECC and RSA-DH policies use ephemeral key agreement that must be
+         * bound to a secured SecureChannel - they must never be used to secure
+         * an auth token over #None. Only the static-RSA encryption policies
+         * (e.g. Basic256Sha256, Aes*_RsaOaep/RsaPss) qualify. */
+        if(UA_SecurityPolicy_isEcc(sp) || UA_SecurityPolicy_isEnhancedSecurity(sp))
             continue;
         /* Return early with Basic256Sha256 when available. "Secure enough" and
          * most clients support it.*/
@@ -338,6 +358,7 @@ static const char *securityModeStrs[4] = {"-invalid", "-none", "-sign", "-sign+e
 
 UA_String
 securityPolicyUriPostfix(const UA_String uri) {
+    if(uri.length == 0) return uri;
     for(UA_Byte *b = uri.data + uri.length - 1; b >= uri.data; b--) {
         if(*b != '#')
             continue;
@@ -351,6 +372,11 @@ static UA_StatusCode
 updateEndpointUserIdentityToken(UA_Server *server,
                                 UA_SecurityPolicyType policyType,
                                 UA_EndpointDescription *ed) {
+    /* Public endpoint configurations must be checked before indexing by mode. */
+    if((UA_UInt32)ed->securityMode < UA_MESSAGESECURITYMODE_NONE ||
+       (UA_UInt32)ed->securityMode > UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+        return UA_STATUSCODE_BADSECURITYMODEREJECTED;
+
     /* Don't modify the UserIdentityTokens if there are manually configured
      * entries */
     if(ed->userIdentityTokensSize > 0)
@@ -420,7 +446,9 @@ updateEndpointUserIdentityToken(UA_Server *server,
             postfix = securityPolicyUriPostfix(ed->securityPolicyUri);
         size_t newLen = utp->policyId.length + postfix.length +
             strlen(securityModeStrs[ed->securityMode]);
-        UA_Byte *newString = (UA_Byte*)UA_realloc(utp->policyId.data, newLen);
+        UA_Byte *newString = (UA_Byte*)
+            UA_realloc((void*)((uintptr_t)utp->policyId.data &
+                               ~(uintptr_t)UA_EMPTY_ARRAY_SENTINEL), newLen);
         if(!newString)
             continue;
         size_t pos = utp->policyId.length;
@@ -438,8 +466,7 @@ updateEndpointUserIdentityToken(UA_Server *server,
 /* Also reused to create the EndpointDescription array in the
  * CreateSessionResponse */
 UA_StatusCode
-setCurrentEndPointsArray(UA_Server *server, UA_SecureChannel *channel,
-                         const UA_String endpointUrl,
+setCurrentEndpointsArray(UA_Server *server, const UA_String endpointUrl,
                          UA_String *profileUris, size_t profileUrisSize,
                          UA_EndpointDescription **arr, size_t *arrSize) {
     UA_ServerConfig *sc = &server->config;
@@ -483,11 +510,6 @@ setCurrentEndPointsArray(UA_Server *server, UA_SecureChannel *channel,
                            "%S which is not available", ep->securityPolicyUri);
             continue;
         }
-
-        /* Coming from CreateSession we have a channel already. Only return
-         * Endpoints where SecurityPolicy is an exact match. */
-        if(channel && channel->securityPolicy != sp)
-            continue;
 
         /* Copy into the results */
         for(size_t i = 0; i < clone_times; ++i) {
@@ -583,7 +605,7 @@ Service_GetEndpoints(UA_Server *server, UA_Session *session,
     /* If the client expects to see a specific endpointurl, mirror it back. If
      * not, clone the endpoints with the discovery url of all networklayers. */
     response->responseHeader.serviceResult =
-        setCurrentEndPointsArray(server, NULL, request->endpointUrl,
+        setCurrentEndpointsArray(server, request->endpointUrl,
                                  request->profileUris, request->profileUrisSize,
                                  &response->endpoints, &response->endpointsSize);
     return true;
@@ -659,6 +681,12 @@ process_RegisterServer(UA_Server *server, UA_Session *session,
 
     if(requestServer->discoveryUrlsSize == 0) {
         responseHeader->serviceResult = UA_STATUSCODE_BADDISCOVERYURLMISSING;
+        return;
+    }
+
+    /* Bound the records queued for mDNS probing by one registration. */
+    if(requestServer->discoveryUrlsSize > 16) {
+        responseHeader->serviceResult = UA_STATUSCODE_BADTOOMANYOPERATIONS;
         return;
     }
 

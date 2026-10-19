@@ -13,8 +13,7 @@
 
 #include "securitypolicy_common.h"
 #include "../deps/musl_inet_pton.h"
-
-#include <time.h>
+#include "mp_printf.h"
 
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/oid.h>
@@ -253,9 +252,9 @@ UA_CreateCertificate(const UA_Logger *logger, const UA_String *subject,
 
         /* split into SAN type and value */
         char *sanType = NULL;
-        for(char *pos = subAlt; *pos != 0; pos++) {
-            if(*pos == ':') {
-                *pos = '\0';
+        for(char *char_pos = subAlt; *char_pos != 0; char_pos++) {
+            if(*char_pos == ':') {
+                *char_pos = '\0';
                 sanType = subAlt;
                 break;
             }
@@ -280,16 +279,22 @@ UA_CreateCertificate(const UA_Logger *logger, const UA_String *subject,
         } else if(strcmp(sanType, "URI") == 0) {
             cur_tmp->node.type = MBEDTLS_X509_SAN_UNIFORM_RESOURCE_IDENTIFIER;
         } else if(strcmp(sanType, "IP") == 0) {
-            uint8_t ip[4] = {0};
+            uint8_t *ip = (uint8_t *)mbedtls_calloc(1, 4);
+            if(!ip) {
+                mbedtls_free(cur_tmp);
+                UA_free(subAlt);
+                continue;
+            }
             if(musl_inet_pton(AF_INET, sanValue, ip) <= 0) {
                 UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURECHANNEL, "IP SAN preparation failed");
+                mbedtls_free(ip);
                 mbedtls_free(cur_tmp);
                 UA_free(subAlt);
                 continue;
             }
             cur_tmp->node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
             cur_tmp->node.host = (char *)ip;
-            cur_tmp->node.hostlen = sizeof(ip);
+            cur_tmp->node.hostlen = 4;
         } else if(strcmp(sanType, "RFC822") == 0) {
             cur_tmp->node.type = MBEDTLS_X509_SAN_RFC822_NAME;
         } else {
@@ -316,6 +321,8 @@ UA_CreateCertificate(const UA_Logger *logger, const UA_String *subject,
         errRet = UA_STATUSCODE_BADINTERNALERROR;
         while(head != NULL) {
             cur_tmp = head->next;
+            if(head->node.type == MBEDTLS_X509_SAN_IP_ADDRESS)
+                mbedtls_free(head->node.host);
             mbedtls_free(head);
             head = cur_tmp;
         }
@@ -324,6 +331,8 @@ UA_CreateCertificate(const UA_Logger *logger, const UA_String *subject,
 
     while(head != NULL) {
         cur_tmp = head->next;
+        if(head->node.type == MBEDTLS_X509_SAN_IP_ADDRESS)
+            mbedtls_free(head->node.host);
         mbedtls_free(head);
         head = cur_tmp;
     }
@@ -341,22 +350,24 @@ UA_CreateCertificate(const UA_Logger *logger, const UA_String *subject,
 #endif
 
     /* Get the current time */
-    time_t rawTime;
-    struct tm *timeInfo;
-    time(&rawTime);
-    timeInfo = gmtime(&rawTime);
+    UA_DateTime now = UA_DateTime_now();
+    UA_DateTimeStruct nowStruct = UA_DateTime_toStruct(now);
 
     /* Format the current timestamp */
     char current_timestamp[15];  // YYYYMMDDhhmmss + '\0'
-    strftime(current_timestamp, sizeof(current_timestamp), "%Y%m%d%H%M%S", timeInfo);
+    mp_snprintf(current_timestamp, sizeof(current_timestamp), "%04d%02u%02u%02u%02u%02u",
+                nowStruct.year, nowStruct.month, nowStruct.day,
+                nowStruct.hour, nowStruct.min, nowStruct.sec);
 
     /* Calculate the future timestamp */
-    timeInfo->tm_mday += expiresInDays;
-    time_t future_time = mktime(timeInfo);
+    UA_DateTime future = now + (UA_DateTime)expiresInDays * 24 * 60 * 60 * UA_DATETIME_SEC;
+    UA_DateTimeStruct futureStruct = UA_DateTime_toStruct(future);
 
     /* Format the future timestamp */
     char future_timestamp[15];  // YYYYMMDDhhmmss + '\0'
-    strftime(future_timestamp, sizeof(future_timestamp), "%Y%m%d%H%M%S", gmtime(&future_time));
+    mp_snprintf(future_timestamp, sizeof(future_timestamp), "%04d%02u%02u%02u%02u%02u",
+                futureStruct.year, futureStruct.month, futureStruct.day,
+                futureStruct.hour, futureStruct.min, futureStruct.sec);
 
     if(mbedtls_x509write_crt_set_validity(&crt, current_timestamp, future_timestamp) != 0) {
         UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURECHANNEL,

@@ -15,12 +15,20 @@
 
 #ifdef UA_ENABLE_ENCRYPTION
 
-#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
+#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) || defined(__OpenBSD__)
 
 #ifdef __linux__
 #define EVENT_SIZE (sizeof(struct inotify_event))
 #define BUF_LEN (1024 * ( EVENT_SIZE + 16 ))
 #endif /* __linux__ */
+
+static size_t
+UA_strnlen(const char *s, size_t maxlen) {
+	    size_t len = 0;
+	        while(len < maxlen && s[len] != '\0')
+			        len++;
+		    return len;
+}
 
 typedef struct {
     /* Memory cert store as a base */
@@ -45,33 +53,35 @@ mkpath(char *dir, UA_MODE mode) {
     if(dir == NULL)
         return 1;
 
-    if(UA_mkdir(dir, mode) == 0)
-        return 0;
-
-    if(errno == EEXIST)
-        return 0; /* Directory already exists */
-
-    if(errno != ENOENT)
+    size_t dirLen = strlen(dir);
+    char *path = (char*)UA_malloc(dirLen + 1);
+    if(!path)
         return 1;
+    memcpy(path, dir, dirLen + 1);
 
-    size_t len = strlen(dir) + 1;
-    char *tmp_dir = (char*)UA_malloc(len);
-    if(!tmp_dir)
+    char *pos = path;
+    if(pos[0] == '/')
+        pos++;
+
+    for(; *pos; pos++) {
+        if(*pos != '/')
+            continue;
+
+        *pos = '\0';
+        if(path[0] != '\0' && UA_mkdir(path, mode) != 0 && errno != EEXIST) {
+            UA_free(path);
+            return 1;
+        }
+        *pos = '/';
+    }
+
+    if(UA_mkdir(path, mode) != 0 && errno != EEXIST) {
+        UA_free(path);
         return 1;
-    memcpy(tmp_dir, dir, len);
+    }
 
-    /* Before the actual target directory is created, the recursive call ensures
-     * that all parent directories are created or already exist. */
-    int retval = mkpath(UA_dirname(tmp_dir), mode);
-    UA_free(tmp_dir);
-
-    if(retval != 0)
-        return retval;
-
-    if(UA_mkdir(dir, mode) == 0 || errno == EEXIST)
-        return 0;
-
-    return 1;
+    UA_free(path);
+    return 0;
 }
 
 static UA_StatusCode
@@ -115,10 +125,11 @@ removeAllFilesFromDir(const char *const path, bool removeSubDirs) {
 }
 
 static UA_StatusCode
-getCertFileName(const char *path, const UA_ByteString *certificate,
-                char *fileNameBuf, size_t fileNameLen) {
+getCertFileName(const char *path, const char *fileExt,
+                const UA_ByteString *certificate, char *fileNameBuf,
+                size_t fileNameLen) {
     /* Check parameter */
-    if(path == NULL || certificate == NULL || fileNameBuf == NULL)
+    if(path == NULL || fileExt == NULL || certificate == NULL || fileNameBuf == NULL)
         return UA_STATUSCODE_BADINTERNALERROR;
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
@@ -152,12 +163,20 @@ getCertFileName(const char *path, const UA_ByteString *certificate,
 
     if(ptr != NULL) {
         subName = ptr + 3;
+        char *endName = strchr(subName, ',');
+        if(endName != NULL)
+            *endName = '\0';
     } else {
         subName = subjectNameBuffer;
     }
 
-    if(mp_snprintf(fileNameBuf, fileNameLen, "%s/%s[%s]", path, subName,
-                   thumbprintBuffer) < 0)
+    for(char *c = subName; *c; c++) {
+        if(*c == '/' || *c == '\\')
+            *c = '_';
+    }
+
+    if(mp_snprintf(fileNameBuf, fileNameLen, "%s/%s[%s]%s", path, subName,
+                   thumbprintBuffer, fileExt) < 0)
         retval = UA_STATUSCODE_BADINTERNALERROR;
 
     UA_String_clear(&thumbprint);
@@ -168,23 +187,50 @@ getCertFileName(const char *path, const UA_ByteString *certificate,
     return retval;
 }
 
+static bool
+isRegularFile(const char *path, const struct UA_DIRENT *dirent) {
+    if(dirent->d_type == UA_DT_DIR)
+        return false;
+    if(dirent->d_type == UA_DT_REG)
+        return true;
+
+#ifndef UA_ARCHITECTURE_WIN32
+    char filename[UA_PATH_MAX] = {0};
+    int len = mp_snprintf(filename, UA_PATH_MAX, "%s/%s", path, dirent->d_name);
+    if(len < 0 || len >= UA_PATH_MAX)
+        return false;
+
+    struct UA_STAT statBuf;
+    return (UA_stat(filename, &statBuf) == 0 && S_ISREG(statBuf.st_mode));
+#else
+    return false;
+#endif
+}
+
 static UA_StatusCode
 readCertificates(UA_ByteString **list, size_t *listSize, const UA_String path) {
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
 
     char listPath[UA_PATH_MAX] = {0};
-    mp_snprintf(listPath, UA_PATH_MAX, "%.*s",
-                (int)path.length, (char*)path.data);
+    int pathLen = mp_snprintf(listPath, UA_PATH_MAX, "%.*s",
+                              (int)path.length, (char*)path.data);
+    if(pathLen < 0 || pathLen >= UA_PATH_MAX)
+        return UA_STATUSCODE_BADINTERNALERROR;
 
     /* Determine number of certificates */
     size_t numCerts = 0;
     UA_DIR *dir = UA_opendir(listPath);
-    if(!dir)
-        return UA_STATUSCODE_BADINTERNALERROR;
+    if(!dir) {
+        if(mkpath(listPath, 0777) != 0)
+            return UA_STATUSCODE_BADINTERNALERROR;
+        dir = UA_opendir(listPath);
+        if(!dir)
+            return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     struct UA_DIRENT *dirent;
     while((dirent = UA_readdir(dir)) != NULL) {
-        if(dirent->d_type != UA_DT_REG)
+        if(!isRegularFile(listPath, dirent))
             continue;
         numCerts++;
     }
@@ -200,7 +246,7 @@ readCertificates(UA_ByteString **list, size_t *listSize, const UA_String path) {
     UA_rewinddir(dir);
 
     while((dirent = UA_readdir(dir)) != NULL) {
-        if(dirent->d_type != UA_DT_REG)
+        if(!isRegularFile(listPath, dirent))
             continue;
         if(numActCerts < numCerts) {
             /* Create filename to load */
@@ -293,9 +339,9 @@ reloadTrustStore(UA_CertificateGroup *certGroup) {
 
 static UA_StatusCode
 writeCertificates(UA_CertificateGroup *certGroup, const UA_ByteString *list,
-                  size_t listSize, const char *listPath) {
+                  size_t listSize, const char *listPath, const char *fileExt) {
     /* Check parameter */
-    if(listPath == NULL)
+    if(listPath == NULL || fileExt == NULL)
         return UA_STATUSCODE_BADINTERNALERROR;
     if(listSize > 0 && list == NULL)
         return UA_STATUSCODE_BADINTERNALERROR;
@@ -304,7 +350,7 @@ writeCertificates(UA_CertificateGroup *certGroup, const UA_ByteString *list,
     for(size_t i = 0; i < listSize; i++) {
         /* Create filename to load */
         char filename[UA_PATH_MAX] = {0};
-        retval = getCertFileName(listPath, &list[i], filename, UA_PATH_MAX);
+        retval = getCertFileName(listPath, fileExt, &list[i], filename, UA_PATH_MAX);
         if(retval != UA_STATUSCODE_GOOD)
             return UA_STATUSCODE_BADINTERNALERROR;
 
@@ -319,21 +365,23 @@ writeCertificates(UA_CertificateGroup *certGroup, const UA_ByteString *list,
 
 static UA_StatusCode
 writeTrustList(UA_CertificateGroup *certGroup, const UA_ByteString *list,
-               size_t listSize, const UA_String path) {
+               size_t listSize, const UA_String path, const UA_String fileExt) {
     /* Check parameter */
-    if(path.length == 0)
+    if(path.length == 0 || fileExt.length == 0)
         return UA_STATUSCODE_BADINTERNALERROR;
     if(listSize > 0 && list == NULL)
         return UA_STATUSCODE_BADINTERNALERROR;
 
     char listPath[UA_PATH_MAX] = {0};
+    char fileExtStr[UA_FILENAME_MAX] = {0};
     mp_snprintf(listPath, UA_PATH_MAX, "%.*s", (int)path.length, (char *)path.data);
+    mp_snprintf(fileExtStr, UA_FILENAME_MAX, "%.*s", (int)fileExt.length, (char *)fileExt.data);
     /* remove existing files in directory */
     UA_StatusCode retval = removeAllFilesFromDir(listPath, false);
     if(retval != UA_STATUSCODE_GOOD)
         return retval;
 
-    return writeCertificates(certGroup, list, listSize, listPath);
+    return writeCertificates(certGroup, list, listSize, listPath, fileExtStr);
 }
 
 static UA_StatusCode
@@ -345,6 +393,8 @@ writeTrustStore(UA_CertificateGroup *certGroup, const UA_UInt32 trustListMask) {
     FileCertStore *context = (FileCertStore *)certGroup->context;
 
     UA_TrustListDataType trustList;
+    const UA_String fileExtCert = UA_STRING_STATIC(".der");
+    const UA_String fileExtCrls = UA_STRING_STATIC(".crl");
     UA_TrustListDataType_init(&trustList);
     trustList.specifiedLists = trustListMask;
 
@@ -353,25 +403,29 @@ writeTrustStore(UA_CertificateGroup *certGroup, const UA_UInt32 trustListMask) {
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     if(trustList.specifiedLists & UA_TRUSTLISTMASKS_TRUSTEDCERTIFICATES) {
         retval = writeTrustList(certGroup, trustList.trustedCertificates,
-                                trustList.trustedCertificatesSize, context->trustedCertFolder);
+                                trustList.trustedCertificatesSize, context->trustedCertFolder,
+                                fileExtCert);
         if(retval != UA_STATUSCODE_GOOD)
             return retval;
     }
     if(trustList.specifiedLists & UA_TRUSTLISTMASKS_TRUSTEDCRLS) {
         retval = writeTrustList(certGroup, trustList.trustedCrls,
-                                trustList.trustedCrlsSize, context->trustedCrlFolder);
+                                trustList.trustedCrlsSize, context->trustedCrlFolder,
+                                fileExtCrls);
         if(retval != UA_STATUSCODE_GOOD)
             return retval;
     }
     if(trustList.specifiedLists & UA_TRUSTLISTMASKS_ISSUERCERTIFICATES) {
         retval = writeTrustList(certGroup, trustList.issuerCertificates,
-                                trustList.issuerCertificatesSize, context->issuerCertFolder);
+                                trustList.issuerCertificatesSize, context->issuerCertFolder,
+                                fileExtCert);
         if(retval != UA_STATUSCODE_GOOD)
             return retval;
     }
     if(trustList.specifiedLists & UA_TRUSTLISTMASKS_ISSUERCRLS) {
         retval = writeTrustList(certGroup, trustList.issuerCrls,
-                                trustList.issuerCrlsSize, context->issuerCrlFolder);
+                                trustList.issuerCrlsSize, context->issuerCrlFolder,
+                                fileExtCrls);
         if(retval != UA_STATUSCODE_GOOD)
             return retval;
     }
@@ -382,19 +436,23 @@ writeTrustStore(UA_CertificateGroup *certGroup, const UA_UInt32 trustListMask) {
 
 static UA_StatusCode
 FileCertStore_setupStorePath(char *directory, char *rootDirectory,
-                             size_t rootDirectorySize, UA_String *out) {
+                             size_t rootDirectorySize, UA_String *out,
+                             const UA_Logger *logger) {
     char path[UA_PATH_MAX] = {0};
-    size_t pathSize = 0;
-
-    strncpy(path, rootDirectory, UA_PATH_MAX - 1);
-    path[UA_PATH_MAX - 1] = '\0';
-    pathSize = strnlen(path, UA_PATH_MAX);
-
-    strncpy(&path[pathSize], directory, UA_PATH_MAX - pathSize);
+    int pathLen = mp_snprintf(path, UA_PATH_MAX, "%.*s%s",
+                              (int)rootDirectorySize, rootDirectory, directory);
+    if(pathLen < 0 || pathLen >= UA_PATH_MAX)
+        return UA_STATUSCODE_BADINTERNALERROR;
 
     *out = UA_STRING_ALLOC(path);
+    if(out->data == NULL)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
 
-    mkpath(path, 0777);
+    if(mkpath(path, 0777) != 0) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_APPLICATION,
+                     "Could not create PKI directory %s (errno %i)", path, errno);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
     return UA_STATUSCODE_GOOD;
 }
 
@@ -414,7 +472,7 @@ FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String
         return UA_STATUSCODE_BADINTERNALERROR;
 
     memcpy(rootDirectory, directory.data, directory.length);
-    rootDirectorySize = strnlen(rootDirectory, UA_PATH_MAX);
+    rootDirectorySize = UA_strnlen(rootDirectory, UA_PATH_MAX);
 
     /* Add Certificate Group Id */
     UA_NodeId applCertGroup =
@@ -437,25 +495,32 @@ FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String
         strncpy(&rootDirectory[rootDirectorySize], (char *)nodeIdStr.data, UA_PATH_MAX - rootDirectorySize);
         UA_String_clear(&nodeIdStr);
     }
-    rootDirectorySize = strnlen(rootDirectory, UA_PATH_MAX);
+    rootDirectorySize = UA_strnlen(rootDirectory, UA_PATH_MAX);
 
     context->rootFolder = UA_STRING_ALLOC(rootDirectory);
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     retval |= FileCertStore_setupStorePath("/trusted/certs", rootDirectory,
-                                           rootDirectorySize, &context->trustedCertFolder);
+                                           rootDirectorySize, &context->trustedCertFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/trusted/crl", rootDirectory,
-                                           rootDirectorySize, &context->trustedCrlFolder);
+                                           rootDirectorySize, &context->trustedCrlFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/issuer/certs", rootDirectory,
-                                           rootDirectorySize, &context->issuerCertFolder);
+                                           rootDirectorySize, &context->issuerCertFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/issuer/crl", rootDirectory,
-                                           rootDirectorySize, &context->issuerCrlFolder);
+                                           rootDirectorySize, &context->issuerCrlFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/rejected/certs", rootDirectory,
-                                           rootDirectorySize, &context->rejectedCertFolder);
+                                           rootDirectorySize, &context->rejectedCertFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/own/certs", rootDirectory,
-                                           rootDirectorySize, &context->ownCertFolder);
+                                           rootDirectorySize, &context->ownCertFolder,
+                                           certGroup->logging);
     retval |= FileCertStore_setupStorePath("/own/private", rootDirectory,
-                                           rootDirectorySize, &context->ownKeyFolder);
+                                           rootDirectorySize, &context->ownKeyFolder,
+                                           certGroup->logging);
 
     return retval;
 }
@@ -617,8 +682,10 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
         /* write rejectedList to filestore */
         UA_ByteString *rejectedList = NULL;
         size_t rejectedListSize = 0;
+        const UA_String fileExtCert = UA_STRING_STATIC(".der");
         context->store->getRejectedList(context->store, &rejectedList, &rejectedListSize);
-        writeTrustList(certGroup, rejectedList, rejectedListSize, context->rejectedCertFolder);
+        writeTrustList(certGroup, rejectedList, rejectedListSize, context->rejectedCertFolder,
+                       fileExtCert);
         UA_Array_delete(rejectedList, rejectedListSize, &UA_TYPES[UA_TYPES_BYTESTRING]);
     }
 
@@ -695,12 +762,16 @@ UA_CertificateGroup_Filestore(UA_CertificateGroup *certGroup,
 
     retval = FileCertStore_createPkiDirectory(certGroup, storePath);
     if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_APPLICATION,
+                     "Could not create the PKI directory structure");
         goto cleanup;
     }
 
     context->store = (UA_CertificateGroup*)UA_calloc(1, sizeof(UA_CertificateGroup));
     retval = UA_CertificateGroup_Memorystore(context->store, certificateGroupId, NULL, logger, params);
     if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_APPLICATION,
+                     "Could not initialize the PKI memory store");
         goto cleanup;
     }
 
@@ -713,6 +784,8 @@ UA_CertificateGroup_Filestore(UA_CertificateGroup *certGroup,
 
     retval = reloadAndWriteTrustStore(certGroup);
     if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_APPLICATION,
+                     "Could not load the PKI trust store from the filestore");
         goto cleanup;
     }
 
